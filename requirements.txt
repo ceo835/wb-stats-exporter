@@ -1,5 +1,5 @@
 streamlit==1.32.0
-pandas==2.1.4
+pandas==2.2.0
 requests==2.31.0
 plotly==5.18.0
 google-api-python-client==2.111.0
@@ -8,3 +8,4 @@ google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
 python-dotenv==1.0.0
 openpyxl==3.1.2
+Pillow==10.2.0
