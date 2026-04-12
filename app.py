@@ -1,4 +1,4 @@
-"""Streamlit app for WB ads analytics."""
+﻿"""Streamlit app for WB ads analytics."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 import data_processor
 from google_sheets import is_google_sheets_configured, try_save_to_google_sheets
-from logger_utils import get_log_level, setup_logging, tail_log_lines
+from logger_utils import get_log_level, setup_logging
 from wb_api import WBApiClient
 
 load_dotenv()
@@ -125,7 +125,14 @@ def _render_theme_css() -> None:
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1rem; }
+        [data-testid="stAppViewContainer"] .main .block-container {
+            padding-top: 2.2rem;
+        }
+        @media (max-width: 768px) {
+            [data-testid="stAppViewContainer"] .main .block-container {
+                padding-top: 2.8rem;
+            }
+        }
         .wb-status-box {
             border: 1px solid #d1d5db;
             border-radius: 10px;
@@ -359,9 +366,10 @@ def main() -> None:
 
         st.dataframe(table_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Статус")
-    st.code("\n".join(tail_log_lines(10)), language="text")
+
 
 
 if __name__ == "__main__":
     main()
+
+
