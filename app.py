@@ -31,6 +31,7 @@ TABLE_MODE_LABEL_TO_VALUE = {
     "Только товары": "items",
     "Все строки": "all",
 }
+TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def _load_streamlit_secrets() -> dict[str, Any]:
@@ -110,12 +111,17 @@ def _fetch_rows_cached(
     start_date: str,
     end_date: str,
     log_level: str,
+    full_scan_all_campaigns: bool = False,
 ) -> list[dict[str, Any]]:
     """Fetch WB stats rows with Streamlit cache."""
     logger = setup_logging(log_level)
     client = WBApiClient(token=token, logger=logger)
     try:
-        return client.fetch_stats_rows(start_date=start_date, end_date=end_date)
+        return client.fetch_stats_rows(
+            start_date=start_date,
+            end_date=end_date,
+            full_scan_all_campaigns=full_scan_all_campaigns,
+        )
     finally:
         client.close()
 
@@ -190,9 +196,16 @@ def main() -> None:
     default_start = today - timedelta(days=6)
     default_end = today
 
-    col_filter_1, col_filter_2, col_filter_3, col_filter_4, col_filter_5, col_filter_6 = st.columns(
-        [1, 1, 1.2, 1.3, 1.2, 1.2]
-    )
+    show_full_scan_option = _get_setting("SHOW_FULL_SCAN_OPTION", "0").lower() in TRUE_VALUES
+
+    if show_full_scan_option:
+        col_filter_1, col_filter_2, col_filter_3, col_filter_4, col_filter_5, col_filter_6, col_filter_7 = st.columns(
+            [1, 1, 1.1, 1.25, 1.05, 1.1, 1.55]
+        )
+    else:
+        col_filter_1, col_filter_2, col_filter_3, col_filter_4, col_filter_5, col_filter_6 = st.columns(
+            [1, 1, 1.2, 1.3, 1.2, 1.2]
+        )
     with col_filter_1:
         start_date = st.date_input("Дата начала", value=default_start, format="YYYY-MM-DD")
     with col_filter_2:
@@ -210,10 +223,28 @@ def main() -> None:
         aggregate_items = st.checkbox("Объединять товары", value=True)
     with col_filter_6:
         export_without_zero = st.checkbox("Экспорт без нулевых", value=True)
+    full_scan_all_campaigns = False
+    if show_full_scan_option:
+        with col_filter_7:
+            full_scan_all_campaigns = st.checkbox(
+                "Полный скан РК (медленно)",
+                value=False,
+                help=(
+                    "Запрашивает статистику по всем кампаниям без фильтра статуса. "
+                    "Режим дольше, чаще получает 429, но дает максимально полное покрытие."
+                ),
+            )
 
     if start_date > end_date:
         st.error("Дата начала не может быть больше даты окончания.")
         return
+
+    if full_scan_all_campaigns:
+        days = (end_date - start_date).days + 1
+        st.warning(
+            "Включен полный скан кампаний. Для больших периодов (например, месяц) "
+            f"загрузка может занять несколько минут. Выбранный период: {days} дн."
+        )
 
     token = _get_setting("WB_TOKEN", "")
     if not token:
@@ -239,15 +270,17 @@ def main() -> None:
                     start_date=start_date.isoformat(),
                     end_date=end_date.isoformat(),
                     log_level=_get_setting("LOG_LEVEL", "INFO"),
+                    full_scan_all_campaigns=full_scan_all_campaigns,
                 )
                 st.session_state["raw_rows"] = raw_rows
                 st.session_state["last_update"] = datetime.now()
                 st.session_state["last_range"] = (start_date.isoformat(), end_date.isoformat())
                 logger.info(
-                    "Данные загружены через UI: %s - %s, строк: %d",
+                    "Данные загружены через UI: %s - %s, строк: %d, full_scan=%s",
                     start_date.isoformat(),
                     end_date.isoformat(),
                     len(raw_rows),
+                    full_scan_all_campaigns,
                 )
             except Exception as exc:  # noqa: BLE001 - display user error
                 logger.exception("Ошибка загрузки данных из WB.")

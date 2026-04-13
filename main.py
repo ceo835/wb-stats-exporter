@@ -22,10 +22,13 @@ from googleapiclient.errors import HttpError
 
 WB_BASE_URL = "https://advert-api.wildberries.ru"
 MAX_BATCH_SIZE = 50
-REQUEST_DELAY_SECONDS = 20
-RATE_LIMIT_SLEEP_SECONDS = 60
+REQUEST_DELAY_SECONDS = 30
+RATE_LIMIT_SLEEP_SECONDS = 90
+MAX_RATE_LIMIT_SLEEP_SECONDS = 600
+MAX_429_RETRIES = 6
 DEFAULT_SHEET_NAME = "Sheet1"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+STOPPED_LOOKBACK_DAYS = 30
 CONVERSION_TYPE_MAP = {
     1: "Прямая",
     32: "Ассоциированная",
@@ -154,14 +157,15 @@ def build_wb_headers(token: str) -> dict[str, str]:
     return {"Authorization": token, "Content-Type": "application/json"}
 
 
-def request_adverts(session: requests.Session, token: str) -> Any:
+def request_adverts(session: requests.Session, token: str, statuses: Optional[str] = "9") -> Any:
     """Request campaign list from WB adverts endpoint."""
     headers = build_wb_headers(token)
+    params = {"statuses": statuses} if statuses else None
 
     response = session.get(
         f"{WB_BASE_URL}/api/advert/v2/adverts",
         headers=headers,
-        params={"statuses": "9"},
+        params=params,
         timeout=30,
     )
     if response.status_code == 404:
@@ -200,6 +204,17 @@ def validate_wb_token(
     logger.info("WB Token validated.")
 
 
+def extract_adverts(payload: Any) -> list[dict[str, Any]]:
+    """Extract adverts list from WB campaigns payload."""
+    if isinstance(payload, dict):
+        payload_adverts = payload.get("adverts", [])
+        if isinstance(payload_adverts, list):
+            return [item for item in payload_adverts if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
 def extract_campaign_id(record: dict[str, Any]) -> Optional[int]:
     """Extract campaign identifier from a record."""
     for key in ("campaign_id", "campaignId", "advertId", "advert_id", "id"):
@@ -213,13 +228,7 @@ def extract_campaign_id(record: dict[str, Any]) -> Optional[int]:
 
 def get_active_campaign_ids(payload: Any, logger: logging.Logger) -> list[int]:
     """Extract active campaign IDs from `/api/advert/v2/adverts` payload."""
-    adverts: list[dict[str, Any]] = []
-    if isinstance(payload, dict):
-        payload_adverts = payload.get("adverts", [])
-        if isinstance(payload_adverts, list):
-            adverts = [item for item in payload_adverts if isinstance(item, dict)]
-    elif isinstance(payload, list):
-        adverts = [item for item in payload if isinstance(item, dict)]
+    adverts = extract_adverts(payload)
 
     active_ids: list[int] = []
     for advert in adverts:
@@ -234,10 +243,83 @@ def get_active_campaign_ids(payload: Any, logger: logging.Logger) -> list[int]:
     return deduped_ids
 
 
+def get_campaign_ids_for_target_date(
+    active_payload: Any,
+    all_payload: Any,
+    target_date: str,
+    logger: logging.Logger,
+) -> list[int]:
+    """Build campaign IDs for target date: active + recently updated non-active."""
+    active_ids = get_active_campaign_ids(active_payload, logger)
+    selected: dict[int, int] = {campaign_id: campaign_id for campaign_id in active_ids}
+
+    if not all_payload:
+        logger.info(
+            "Found %d campaigns for target date %s (only active list used).",
+            len(selected),
+            target_date,
+        )
+        return list(selected.values())
+
+    all_adverts = extract_adverts(all_payload)
+    lower_bound = (
+        datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=STOPPED_LOOKBACK_DAYS)
+    ).strftime("%Y-%m-%d")
+
+    extra_count = 0
+    for advert in all_adverts:
+        campaign_id = extract_campaign_id(advert)
+        if campaign_id is None or campaign_id in selected:
+            continue
+        status_raw = advert.get("status")
+        try:
+            status = int(status_raw) if status_raw is not None else None
+        except (TypeError, ValueError):
+            status = None
+        if status in (None, 9):
+            continue
+
+        timestamps = advert.get("timestamps")
+        if not isinstance(timestamps, dict):
+            continue
+
+        started_day = normalize_iso_date(timestamps.get("started"))
+        if started_day and started_day > target_date:
+            continue
+
+        updated_day = normalize_iso_date(timestamps.get("updated"))
+        if not updated_day:
+            continue
+        if updated_day >= lower_bound:
+            selected[campaign_id] = campaign_id
+            extra_count += 1
+
+    logger.info(
+        "Found %d campaigns for target date %s (active: %d, added stopped in %d days: %d).",
+        len(selected),
+        target_date,
+        len(active_ids),
+        STOPPED_LOOKBACK_DAYS,
+        extra_count,
+    )
+    return list(selected.values())
+
+
 def chunked(items: list[int], size: int) -> Iterable[list[int]]:
     """Split list into chunks of fixed size."""
     for index in range(0, len(items), size):
         yield items[index : index + size]
+
+
+def parse_retry_after_seconds(response: requests.Response) -> Optional[int]:
+    """Parse Retry-After header (seconds)."""
+    value = response.headers.get("Retry-After", "").strip()
+    if not value:
+        return None
+    try:
+        return max(1, int(float(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 def request_fullstats_batch(
@@ -255,6 +337,7 @@ def request_fullstats_batch(
         "beginDate": target_date,
         "endDate": target_date,
     }
+    rate_attempt = 0
 
     while True:
         try:
@@ -274,12 +357,28 @@ def request_fullstats_batch(
                 )
                 return None
         if response.status_code == 429:
-            logger.warning(
-                "Received 429 for batch %s. Sleeping %s seconds...",
-                campaign_ids,
-                RATE_LIMIT_SLEEP_SECONDS,
+            rate_attempt += 1
+            if rate_attempt > MAX_429_RETRIES:
+                logger.error(
+                    "429 retries exceeded for batch %s (%d attempts).",
+                    campaign_ids,
+                    MAX_429_RETRIES,
+                )
+                return None
+            retry_after_seconds = parse_retry_after_seconds(response)
+            exponential_backoff = min(
+                RATE_LIMIT_SLEEP_SECONDS * (2 ** (rate_attempt - 1)),
+                MAX_RATE_LIMIT_SLEEP_SECONDS,
             )
-            time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+            sleep_seconds = max(retry_after_seconds or 0, exponential_backoff)
+            logger.warning(
+                "Received 429 for batch %s (attempt %d/%d). Sleeping %s seconds...",
+                campaign_ids,
+                rate_attempt,
+                MAX_429_RETRIES,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
             continue
         if response.status_code >= 500:
             logger.error(
@@ -680,12 +779,26 @@ def main() -> int:
         validate_wb_token(session=session, token=config.wb_token, logger=logger)
 
         try:
-            campaigns_payload = request_adverts(session, config.wb_token)
+            campaigns_payload_active = request_adverts(session, config.wb_token, statuses="9")
         except requests.RequestException:
             logger.exception("Campaign list request failed.")
             return 1
 
-        campaign_ids = get_active_campaign_ids(campaigns_payload, logger)
+        campaigns_payload_all: Any = None
+        try:
+            campaigns_payload_all = request_adverts(session, config.wb_token, statuses=None)
+        except Exception as exc:  # noqa: BLE001 - non-critical fallback
+            logger.warning(
+                "Failed to load all campaigns list, fallback to active only: %s",
+                exc,
+            )
+
+        campaign_ids = get_campaign_ids_for_target_date(
+            active_payload=campaigns_payload_active,
+            all_payload=campaigns_payload_all,
+            target_date=config.target_date,
+            logger=logger,
+        )
 
         stats_payloads = fetch_fullstats(
             session=session,

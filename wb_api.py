@@ -6,18 +6,22 @@ import copy
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
 import requests
 
 WB_BASE_URL = "https://advert-api.wildberries.ru"
 MAX_BATCH_SIZE = 50
-BATCH_SLEEP_SECONDS = 20
-RATE_LIMIT_SLEEP_SECONDS = 60
-MAX_429_RETRIES = 5
+BATCH_SLEEP_SECONDS = 30
+FULL_SCAN_BATCH_SLEEP_SECONDS = 45
+RATE_LIMIT_SLEEP_SECONDS = 90
+MAX_RATE_LIMIT_SLEEP_SECONDS = 600
+MAX_429_RETRIES = 6
 MAX_NETWORK_RETRIES = 3
 NETWORK_RETRY_BASE_SLEEP_SECONDS = 5
+FULLSTATS_MIN_REQUEST_INTERVAL_SECONDS = 2
+STOPPED_LOOKBACK_DAYS = 30
 
 CONVERSION_TYPE_MAP = {
     1: "Прямая",
@@ -33,6 +37,8 @@ class Campaign:
     campaign_id: int
     campaign_name: str
     status: Optional[int] = None
+    updated_at: Optional[str] = None
+    started_at: Optional[str] = None
 
 
 class WBApiClient:
@@ -43,6 +49,7 @@ class WBApiClient:
         self.logger = logger
         self.session = requests.Session()
         self._stats_cache: dict[tuple[str, str, tuple[int, ...]], list[dict[str, Any]]] = {}
+        self._fullstats_next_request_at: float = 0.0
 
     def close(self) -> None:
         """Close underlying HTTP session."""
@@ -63,10 +70,105 @@ class WBApiClient:
 
     def get_active_campaigns(self) -> list[Campaign]:
         """Load active campaigns with fallback to legacy endpoint."""
+        campaigns = self._request_campaigns(statuses="9", only_active=True)
+        self.logger.info("Найдено активных кампаний: %d", len(campaigns))
+        return campaigns
+
+    def get_campaigns_for_period(
+        self,
+        start_date: str,
+        end_date: str,
+        full_scan_all_campaigns: bool = False,
+    ) -> list[Campaign]:
+        """Select campaigns likely to have stats for the requested period."""
+        try:
+            all_campaigns = self._request_campaigns(statuses=None, only_active=False)
+        except Exception as exc:  # noqa: BLE001 - non-critical fallback
+            active_campaigns = self.get_active_campaigns()
+            if full_scan_all_campaigns:
+                self.logger.warning(
+                    "Не удалось загрузить все кампании для полного скана, используем только активные: %s",
+                    exc,
+                )
+                return active_campaigns
+            self.logger.warning("Не удалось загрузить все кампании, используем только активные: %s", exc)
+            return active_campaigns
+
+        if full_scan_all_campaigns:
+            selected: dict[int, Campaign] = {}
+            for campaign in all_campaigns:
+                if not self._campaign_started_in_future(campaign, end_date):
+                    selected[campaign.campaign_id] = campaign
+            self.logger.info(
+                "Полный скан включен: кампаний для периода %s - %s: %d.",
+                start_date,
+                end_date,
+                len(selected),
+            )
+            return list(selected.values())
+
+        active_campaigns = self.get_active_campaigns()
+        selected = {campaign.campaign_id: campaign for campaign in active_campaigns}
+
+        lower_bound = (
+            datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=STOPPED_LOOKBACK_DAYS)
+        ).strftime("%Y-%m-%d")
+        extra_count = 0
+        for campaign in all_campaigns:
+            if campaign.campaign_id in selected:
+                continue
+            if self._campaign_matches_period(campaign, lower_bound, end_date):
+                selected[campaign.campaign_id] = campaign
+                extra_count += 1
+
+        self.logger.info(
+            "Кампаний для периода %s - %s: %d (активных: %d, добавлено остановленных за %d дн.: %d).",
+            start_date,
+            end_date,
+            len(selected),
+            len(active_campaigns),
+            STOPPED_LOOKBACK_DAYS,
+            extra_count,
+        )
+        return list(selected.values())
+
+    def fetch_stats_rows(
+        self,
+        start_date: str,
+        end_date: str,
+        full_scan_all_campaigns: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fetch and flatten WB stats for selected date range."""
+        self._validate_date_string(start_date)
+        self._validate_date_string(end_date)
+
+        campaigns = self.get_campaigns_for_period(
+            start_date,
+            end_date,
+            full_scan_all_campaigns=full_scan_all_campaigns,
+        )
+        if not campaigns:
+            return []
+
+        campaign_ids = [campaign.campaign_id for campaign in campaigns]
+        campaign_map = {campaign.campaign_id: campaign.campaign_name for campaign in campaigns}
+
+        batch_sleep_seconds = FULL_SCAN_BATCH_SLEEP_SECONDS if full_scan_all_campaigns else BATCH_SLEEP_SECONDS
+        payloads = self.fetch_fullstats_batches(
+            campaign_ids,
+            start_date,
+            end_date,
+            batch_sleep_seconds=batch_sleep_seconds,
+        )
+        rows = self._flatten_fullstats(payloads, campaign_map, start_date, end_date)
+        return rows
+
+    def _request_campaigns(self, statuses: Optional[str], only_active: bool) -> list[Campaign]:
+        params = {"statuses": statuses} if statuses else None
         response = self.session.get(
             f"{WB_BASE_URL}/api/advert/v2/adverts",
             headers=self.headers,
-            params={"statuses": "9"},
+            params=params,
             timeout=30,
         )
 
@@ -85,28 +187,14 @@ class WBApiClient:
             )
 
         payload = response.json()
-        campaigns = self._parse_campaigns(payload)
-        self.logger.info("Найдено активных кампаний: %d", len(campaigns))
-        return campaigns
-
-    def fetch_stats_rows(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
-        """Fetch and flatten WB stats for selected date range."""
-        self._validate_date_string(start_date)
-        self._validate_date_string(end_date)
-
-        campaigns = self.get_active_campaigns()
-        if not campaigns:
-            return []
-
-        campaign_ids = [campaign.campaign_id for campaign in campaigns]
-        campaign_map = {campaign.campaign_id: campaign.campaign_name for campaign in campaigns}
-
-        payloads = self.fetch_fullstats_batches(campaign_ids, start_date, end_date)
-        rows = self._flatten_fullstats(payloads, campaign_map, start_date, end_date)
-        return rows
+        return self._parse_campaigns(payload, only_active=only_active)
 
     def fetch_fullstats_batches(
-        self, campaign_ids: list[int], start_date: str, end_date: str
+        self,
+        campaign_ids: list[int],
+        start_date: str,
+        end_date: str,
+        batch_sleep_seconds: int = BATCH_SLEEP_SECONDS,
     ) -> list[dict[str, Any]]:
         """Load `/adv/v3/fullstats` with batching and retry."""
         cache_key = (start_date, end_date, tuple(sorted(campaign_ids)))
@@ -130,7 +218,7 @@ class WBApiClient:
                 self.logger.info("Загружены данные для кампаний: %s", batch_ids)
 
             if index < len(batches):
-                time.sleep(BATCH_SLEEP_SECONDS)
+                time.sleep(batch_sleep_seconds)
 
         self._stats_cache[cache_key] = copy.deepcopy(all_items)
         return all_items
@@ -146,6 +234,7 @@ class WBApiClient:
         network_attempt = 0
         rate_attempt = 0
         while True:
+            self._wait_for_fullstats_slot()
             try:
                 response = self.session.get(
                     f"{WB_BASE_URL}/adv/v3/fullstats",
@@ -178,6 +267,7 @@ class WBApiClient:
             self._raise_for_auth(response, "fullstats")
 
             if response.status_code == 200:
+                self._set_fullstats_cooldown(FULLSTATS_MIN_REQUEST_INTERVAL_SECONDS)
                 try:
                     payload = response.json()
                 except ValueError as exc:
@@ -196,14 +286,21 @@ class WBApiClient:
                         MAX_429_RETRIES,
                     )
                     return []
+                retry_after_seconds = self._retry_after_seconds(response)
+                exponential_backoff = min(
+                    RATE_LIMIT_SLEEP_SECONDS * (2 ** (rate_attempt - 1)),
+                    MAX_RATE_LIMIT_SLEEP_SECONDS,
+                )
+                sleep_seconds = max(retry_after_seconds or 0, exponential_backoff)
+                self._set_fullstats_cooldown(sleep_seconds)
                 self.logger.warning(
                     "429 для батча %s (попытка %d/%d), ожидание %d сек.",
                     batch_ids,
                     rate_attempt,
                     MAX_429_RETRIES,
-                    RATE_LIMIT_SLEEP_SECONDS,
+                    sleep_seconds,
                 )
-                time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                time.sleep(sleep_seconds)
                 continue
 
             if response.status_code >= 500:
@@ -309,7 +406,7 @@ class WBApiClient:
             response = self.session.post(legacy_url, headers=self.headers, json={}, timeout=30)
         return response
 
-    def _parse_campaigns(self, payload: Any) -> list[Campaign]:
+    def _parse_campaigns(self, payload: Any, only_active: bool = True) -> list[Campaign]:
         campaigns: list[Campaign] = []
 
         if isinstance(payload, dict) and isinstance(payload.get("adverts"), list):
@@ -320,10 +417,21 @@ class WBApiClient:
                 if campaign_id is None:
                     continue
                 status = self._to_int(item.get("status"))
-                if status not in (None, 9):
+                if only_active and status not in (None, 9):
                     continue
                 name = str(item.get("settings", {}).get("name", "")).strip()
-                campaigns.append(Campaign(campaign_id=campaign_id, campaign_name=name, status=status))
+                timestamps = item.get("timestamps")
+                if not isinstance(timestamps, dict):
+                    timestamps = {}
+                campaigns.append(
+                    Campaign(
+                        campaign_id=campaign_id,
+                        campaign_name=name,
+                        status=status,
+                        updated_at=self._normalize_date(timestamps.get("updated")),
+                        started_at=self._normalize_date(timestamps.get("started")),
+                    )
+                )
             return campaigns
 
         for record in self._walk_dicts(payload):
@@ -336,7 +444,7 @@ class WBApiClient:
             if campaign_id is None:
                 continue
             status = record.get("status") or record.get("state")
-            if not self._is_active_status(status):
+            if only_active and not self._is_active_status(status):
                 continue
 
             name = str(
@@ -346,7 +454,18 @@ class WBApiClient:
                 or record.get("title")
                 or ""
             ).strip()
-            campaigns.append(Campaign(campaign_id=campaign_id, campaign_name=name, status=self._to_int(status)))
+            timestamps = record.get("timestamps")
+            if not isinstance(timestamps, dict):
+                timestamps = {}
+            campaigns.append(
+                Campaign(
+                    campaign_id=campaign_id,
+                    campaign_name=name,
+                    status=self._to_int(status),
+                    updated_at=self._normalize_date(timestamps.get("updated")),
+                    started_at=self._normalize_date(timestamps.get("started")),
+                )
+            )
 
         unique: dict[int, Campaign] = {}
         for campaign in campaigns:
@@ -461,6 +580,46 @@ class WBApiClient:
         if not day:
             return False
         return start_date <= day <= end_date
+
+    @staticmethod
+    def _campaign_matches_period(campaign: Campaign, lower_bound: str, end_date: str) -> bool:
+        if WBApiClient._campaign_started_in_future(campaign, end_date):
+            return False
+        status = campaign.status
+        if status is None or int(status) == 9:
+            return False
+        updated_day = WBApiClient._normalize_date(campaign.updated_at)
+        if not updated_day:
+            return False
+        return updated_day >= lower_bound
+
+    @staticmethod
+    def _campaign_started_in_future(campaign: Campaign, end_date: str) -> bool:
+        started_day = WBApiClient._normalize_date(campaign.started_at)
+        return bool(started_day and started_day > end_date)
+
+    def _wait_for_fullstats_slot(self) -> None:
+        now = time.monotonic()
+        wait_seconds = self._fullstats_next_request_at - now
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _set_fullstats_cooldown(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        target = time.monotonic() + float(seconds)
+        if target > self._fullstats_next_request_at:
+            self._fullstats_next_request_at = target
+
+    @staticmethod
+    def _retry_after_seconds(response: requests.Response) -> Optional[int]:
+        value = response.headers.get("Retry-After", "").strip()
+        if not value:
+            return None
+        try:
+            return max(1, int(float(value)))
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _raise_for_auth(response: requests.Response, scope: str) -> None:
