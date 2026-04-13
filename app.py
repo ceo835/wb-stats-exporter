@@ -26,11 +26,6 @@ st.set_page_config(
 )
 
 
-TABLE_MODE_LABEL_TO_VALUE = {
-    "Только итоги кампаний": "totals",
-    "Только товары": "items",
-    "Все строки": "all",
-}
 TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -211,18 +206,13 @@ def main() -> None:
     with col_filter_2:
         end_date = st.date_input("Дата окончания", value=default_end, format="YYYY-MM-DD")
     with col_filter_3:
-        filter_zero_spend = st.checkbox("Скрыть нулевые (экран)", value=True)
+        filter_zero_spend = st.checkbox("Скрыть нулевые товары (только KPI/графики)", value=False)
     with col_filter_4:
-        table_mode_label = st.selectbox(
-            "Таблица",
-            list(TABLE_MODE_LABEL_TO_VALUE.keys()),
-            index=1,
-        )
-        table_mode = TABLE_MODE_LABEL_TO_VALUE[table_mode_label]
+        st.caption("Таблицы: Кампании / Товары / Товары детально")
     with col_filter_5:
-        aggregate_items = st.checkbox("Объединять товары", value=True)
+        st.caption("Товары: агрегировано и детально (отдельные вкладки)")
     with col_filter_6:
-        export_without_zero = st.checkbox("Экспорт без нулевых", value=True)
+        st.caption("Таблицы и Excel всегда включают нулевые товары (как в WB).")
     full_scan_all_campaigns = False
     if show_full_scan_option:
         with col_filter_7:
@@ -291,14 +281,12 @@ def main() -> None:
         prepared_view = data_processor.prepare_data(
             rows=raw_rows,
             filter_zero_spend=filter_zero_spend,
-            table_mode=table_mode,
-            aggregate_items=aggregate_items,
         )
         st.session_state["prepared_view"] = prepared_view
 
         prepared_export = data_processor.prepare_data(
             rows=raw_rows,
-            filter_zero_spend=export_without_zero,
+            filter_zero_spend=False,
             table_mode="all",
             aggregate_items=False,
         )
@@ -321,6 +309,10 @@ def main() -> None:
         start_used, end_used = st.session_state.get("last_range", ("", ""))
         export_raw_df = prepared_export["raw_df"] if prepared_export else prepared["raw_df"]
         export_summary_df = prepared_export["summary_df"] if prepared_export else prepared["summary_df"]
+        report_sheets = data_processor.build_report_sheets(
+            raw_df=export_raw_df,
+            summary_df=export_summary_df,
+        )
         excel_bytes, excel_name = data_processor.build_excel_report(
             raw_df=export_raw_df,
             summary_df=export_summary_df,
@@ -384,20 +376,28 @@ def main() -> None:
             config=config,
         )
 
-        st.subheader("Таблица данных")
-        table_df = prepared["table_df"].copy()
-
-        if not table_df.empty and "ID кампании" in table_df.columns:
-            campaign_ids = table_df["ID кампании"].dropna().astype(str).drop_duplicates().tolist()
+        st.subheader("Таблицы (как в Excel)")
+        campaign_filter_source = report_sheets.get("Кампании")
+        selected_campaigns: list[str] = []
+        if campaign_filter_source is not None and not campaign_filter_source.empty and "ID кампании" in campaign_filter_source.columns:
+            campaign_ids = campaign_filter_source["ID кампании"].dropna().astype(str).drop_duplicates().tolist()
             selected_campaigns = st.multiselect(
                 "Фильтр по кампаниям",
                 options=campaign_ids,
                 default=[],
             )
-            if selected_campaigns:
-                table_df = table_df[table_df["ID кампании"].astype(str).isin(selected_campaigns)].copy()
 
-        st.dataframe(table_df, use_container_width=True, hide_index=True)
+        tabs = st.tabs(data_processor.REPORT_SHEET_ORDER)
+        for tab, sheet_name in zip(tabs, data_processor.REPORT_SHEET_ORDER):
+            with tab:
+                table_df = report_sheets.get(sheet_name)
+                if table_df is None or table_df.empty:
+                    st.info("Нет данных.")
+                    continue
+                filtered_df = table_df
+                if selected_campaigns and "ID кампании" in filtered_df.columns:
+                    filtered_df = filtered_df[filtered_df["ID кампании"].astype(str).isin(selected_campaigns)].copy()
+                st.dataframe(filtered_df, use_container_width=True, hide_index=True)
 
 
 

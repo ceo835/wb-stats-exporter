@@ -110,6 +110,13 @@ SUMMARY_RENAME_MAP = {
     "ROI": "ROI, %",
 }
 
+REPORT_SHEET_ORDER = [
+    "Сводные",
+    "Кампании",
+    "Товары",
+    "Товары детально",
+]
+
 METRIC_COLUMNS_FOR_VALIDATION = ["spend", "clicks", "orders", "views", "revenue"]
 ROI_MIN_SPEND = 1.0
 ROW_TYPE_DISPLAY_MAP = {
@@ -133,6 +140,8 @@ def prepare_data(
     aggregate_items:
         - True: merge equal products in table by campaign_id + nm_id
         - False: keep detailed item rows
+    filter_zero_spend:
+        - True: hide only zero-spend item rows; keep campaign_total rows
     """
     if not rows:
         empty = pd.DataFrame()
@@ -154,7 +163,7 @@ def prepare_data(
     warnings.extend(_validate_item_totals_consistency(df))
 
     if filter_zero_spend:
-        df = df[df["spend"] > 0].copy()
+        df = _filter_zero_spend_item_rows(df)
 
     if df.empty:
         empty = pd.DataFrame()
@@ -215,6 +224,23 @@ def _filter_noise_rows(df: pd.DataFrame) -> pd.DataFrame:
     filtered = filtered[keep_mask].copy()
 
     return filtered.reset_index(drop=True)
+
+
+def _filter_zero_spend_item_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop only item rows with zero spend; keep campaign totals intact."""
+    if df.empty:
+        return df
+
+    filtered = df.copy()
+    if "row_type" not in filtered.columns:
+        filtered["row_type"] = ""
+    if "spend" not in filtered.columns:
+        filtered["spend"] = 0
+
+    is_item = filtered["row_type"].astype(str).eq("item")
+    positive_spend = pd.to_numeric(filtered["spend"], errors="coerce").fillna(0).gt(0)
+    keep_mask = (~is_item) | positive_spend
+    return filtered[keep_mask].reset_index(drop=True)
 
 
 def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -358,6 +384,11 @@ def _build_table_df(
             result = pd.concat([totals, items], ignore_index=True)
             result = result.sort_values(by=["campaign_id", "row_type"], ascending=[True, False]).reset_index(drop=True)
 
+    return _to_display_table(result)
+
+
+def _to_display_table(result: pd.DataFrame) -> pd.DataFrame:
+    """Convert internal dataframe to UI/export display columns."""
     columns = [column for column in RAW_DISPLAY_COLUMNS if column in result.columns]
     result = result[columns].rename(columns=RAW_RENAME_MAP)
     if "Тип строки" in result.columns:
@@ -413,6 +444,91 @@ def _aggregate_items_for_table(item_df: pd.DataFrame) -> pd.DataFrame:
     grouped = _add_derived_metrics(grouped)
     grouped = grouped.sort_values(by=["campaign_id", "ordered_items"], ascending=[True, False]).reset_index(drop=True)
     return grouped
+
+
+def _aggregate_items_detailed_for_table(item_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate items by campaign + nm_id + conversion_type (keep attribution split)."""
+    if item_df.empty:
+        return item_df
+
+    base_items = item_df[item_df["row_type"] == "item"].copy()
+    if base_items.empty:
+        return item_df
+
+    base_items["nm_id"] = pd.to_numeric(base_items["nm_id"], errors="coerce").astype("Int64")
+    base_items["conversion_type"] = base_items["conversion_type"].fillna("").astype(str)
+
+    grouped = (
+        base_items.groupby(
+            ["campaign_id", "campaign_name", "nm_id", "conversion_type"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            nm_name=("nm_name", _first_non_empty),
+            app_type=("app_type", "first"),
+            spend=("spend", "sum"),
+            revenue=("revenue", "sum"),
+            views=("views", "sum"),
+            clicks=("clicks", "sum"),
+            atbs=("atbs", "sum"),
+            orders=("orders", "sum"),
+            ordered_items=("ordered_items", "sum"),
+            canceled=("canceled", "sum"),
+        )
+        .copy()
+    )
+
+    grouped["nm_id"] = grouped["nm_id"].fillna(0).astype(int)
+    grouped["date"] = "За период"
+    grouped["row_type"] = "item"
+    grouped["avg_position"] = pd.NA
+    grouped["currency"] = "RUB"
+
+    grouped = _add_derived_metrics(grouped)
+    grouped = grouped.sort_values(
+        by=["campaign_id", "nm_id", "conversion_type"],
+        ascending=[True, True, True],
+    ).reset_index(drop=True)
+    return grouped
+
+
+def _prepare_summary_export(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare summary sheet columns and labels."""
+    summary_export = summary_df.copy()
+    if summary_export.empty:
+        summary_export = pd.DataFrame(columns=SUMMARY_COLUMNS)
+    summary_export = summary_export[[column for column in SUMMARY_COLUMNS if column in summary_export.columns]]
+    summary_export = summary_export.rename(columns=SUMMARY_RENAME_MAP)
+    return summary_export
+
+
+def build_report_sheets(raw_df: pd.DataFrame, summary_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Build final report tables used both in UI and Excel export."""
+    base_raw = raw_df.copy()
+    if base_raw.empty:
+        base_raw = pd.DataFrame(columns=RAW_DISPLAY_COLUMNS)
+
+    campaign_rows = base_raw[base_raw["row_type"] == "campaign_total"].copy()
+    if campaign_rows.empty:
+        campaign_rows = pd.DataFrame(columns=RAW_DISPLAY_COLUMNS)
+
+    item_rows = base_raw[base_raw["row_type"] == "item"].copy()
+
+    items_aggregated_rows = _aggregate_items_for_table(item_rows)
+    if items_aggregated_rows.empty:
+        items_aggregated_rows = pd.DataFrame(columns=RAW_DISPLAY_COLUMNS)
+
+    items_detailed_rows = _aggregate_items_detailed_for_table(item_rows)
+    if items_detailed_rows.empty:
+        items_detailed_rows = pd.DataFrame(columns=RAW_DISPLAY_COLUMNS)
+
+    return {
+        "Сводные": _prepare_summary_export(summary_df),
+        "Кампании": _to_display_table(campaign_rows),
+        "Товары": _to_display_table(items_aggregated_rows),
+        "Товары детально": _to_display_table(items_detailed_rows),
+    }
 
 
 def _first_non_empty(series: pd.Series) -> str:
@@ -597,28 +713,17 @@ def build_excel_report(
     start_date: str,
     end_date: str,
 ) -> tuple[bytes, str]:
-    """Build xlsx report with formatting and 2 sheets."""
-    raw_export = raw_df.copy()
-    if raw_export.empty:
-        raw_export = pd.DataFrame(columns=RAW_DISPLAY_COLUMNS)
-    raw_export = raw_export[[column for column in RAW_DISPLAY_COLUMNS if column in raw_export.columns]]
-    raw_export = raw_export.rename(columns=RAW_RENAME_MAP)
-    if "Тип строки" in raw_export.columns:
-        raw_export["Тип строки"] = raw_export["Тип строки"].replace(ROW_TYPE_DISPLAY_MAP)
-
-    summary_export = summary_df.copy()
-    if summary_export.empty:
-        summary_export = pd.DataFrame(columns=SUMMARY_COLUMNS)
-    summary_export = summary_export[[column for column in SUMMARY_COLUMNS if column in summary_export.columns]]
-    summary_export = summary_export.rename(columns=SUMMARY_RENAME_MAP)
+    """Build xlsx report with formatting and report sheets."""
+    report_sheets = build_report_sheets(raw_df=raw_df, summary_df=summary_df)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        raw_export.to_excel(writer, sheet_name="Данные", index=False)
-        summary_export.to_excel(writer, sheet_name="Сводные", index=False)
+        for sheet_name in REPORT_SHEET_ORDER:
+            table = report_sheets.get(sheet_name, pd.DataFrame())
+            table.to_excel(writer, sheet_name=sheet_name, index=False)
 
         workbook = writer.book
-        for worksheet_name in ("Данные", "Сводные"):
+        for worksheet_name in REPORT_SHEET_ORDER:
             worksheet = workbook[worksheet_name]
             _style_worksheet(worksheet)
 
