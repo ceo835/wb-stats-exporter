@@ -713,17 +713,28 @@ def build_excel_report(
     start_date: str,
     end_date: str,
 ) -> tuple[bytes, str]:
-    """Build xlsx report with formatting and report sheets."""
-    report_sheets = build_report_sheets(raw_df=raw_df, summary_df=summary_df)
+    """Build xlsx report with formatting and 2 sheets."""
+    raw_export = raw_df.copy()
+    if raw_export.empty:
+        raw_export = pd.DataFrame(columns=RAW_DISPLAY_COLUMNS)
+    raw_export = raw_export[[column for column in RAW_DISPLAY_COLUMNS if column in raw_export.columns]]
+    raw_export = raw_export.rename(columns=RAW_RENAME_MAP)
+    if "Тип строки" in raw_export.columns:
+        raw_export["Тип строки"] = raw_export["Тип строки"].replace(ROW_TYPE_DISPLAY_MAP)
+
+    summary_export = summary_df.copy()
+    if summary_export.empty:
+        summary_export = pd.DataFrame(columns=SUMMARY_COLUMNS)
+    summary_export = summary_export[[column for column in SUMMARY_COLUMNS if column in summary_export.columns]]
+    summary_export = summary_export.rename(columns=SUMMARY_RENAME_MAP)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet_name in REPORT_SHEET_ORDER:
-            table = report_sheets.get(sheet_name, pd.DataFrame())
-            table.to_excel(writer, sheet_name=sheet_name, index=False)
+        raw_export.to_excel(writer, sheet_name="Данные", index=False)
+        summary_export.to_excel(writer, sheet_name="Сводные", index=False)
 
         workbook = writer.book
-        for worksheet_name in REPORT_SHEET_ORDER:
+        for worksheet_name in ("Данные", "Сводные"):
             worksheet = workbook[worksheet_name]
             _style_worksheet(worksheet)
 

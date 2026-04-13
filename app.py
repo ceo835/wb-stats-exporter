@@ -26,6 +26,11 @@ st.set_page_config(
 )
 
 
+TABLE_MODE_LABEL_TO_VALUE = {
+    "Только итоги кампаний": "totals",
+    "Только товары": "items",
+    "Все строки": "all",
+}
 TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -84,32 +89,6 @@ def _get_logger() -> logging.Logger:
     """Get initialized logger."""
     log_level = _get_setting("LOG_LEVEL", get_log_level("INFO"))
     return setup_logging(log_level=log_level)
-
-
-def _build_report_sheets_compat(prepared_export: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
-    """Build report sheets with backward compatibility for older data_processor."""
-    if not prepared_export:
-        return {}, []
-
-    raw_df = prepared_export.get("raw_df")
-    summary_df = prepared_export.get("summary_df")
-    table_df = prepared_export.get("table_df")
-
-    builder = getattr(data_processor, "build_report_sheets", None)
-    if callable(builder):
-        sheets = builder(raw_df=raw_df, summary_df=summary_df)
-        order = getattr(data_processor, "REPORT_SHEET_ORDER", list(sheets.keys()))
-        return sheets, list(order)
-
-    # Fallback for older deployments where build_report_sheets is unavailable.
-    sheets: dict[str, Any] = {}
-    if summary_df is not None:
-        sheets["Сводные"] = summary_df
-    if table_df is not None:
-        sheets["Данные"] = table_df
-    elif raw_df is not None:
-        sheets["Данные"] = raw_df
-    return sheets, list(sheets.keys())
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -232,13 +211,18 @@ def main() -> None:
     with col_filter_2:
         end_date = st.date_input("Дата окончания", value=default_end, format="YYYY-MM-DD")
     with col_filter_3:
-        filter_zero_spend = st.checkbox("Скрыть нулевые товары (только KPI/графики)", value=False)
+        filter_zero_spend = st.checkbox("Скрыть нулевые товары (экран)", value=False)
     with col_filter_4:
-        st.caption("Таблицы: Кампании / Товары / Товары детально")
+        table_mode_label = st.selectbox(
+            "Таблица",
+            list(TABLE_MODE_LABEL_TO_VALUE.keys()),
+            index=1,
+        )
+        table_mode = TABLE_MODE_LABEL_TO_VALUE[table_mode_label]
     with col_filter_5:
-        st.caption("Товары: агрегировано и детально (отдельные вкладки)")
+        aggregate_items = st.checkbox("Объединять товары", value=True)
     with col_filter_6:
-        st.caption("Таблицы и Excel всегда включают нулевые товары (как в WB).")
+        st.caption("Экспорт: все данные (включая нулевые), как в WB.")
     full_scan_all_campaigns = False
     if show_full_scan_option:
         with col_filter_7:
@@ -307,6 +291,8 @@ def main() -> None:
         prepared_view = data_processor.prepare_data(
             rows=raw_rows,
             filter_zero_spend=filter_zero_spend,
+            table_mode=table_mode,
+            aggregate_items=aggregate_items,
         )
         st.session_state["prepared_view"] = prepared_view
 
@@ -335,7 +321,6 @@ def main() -> None:
         start_used, end_used = st.session_state.get("last_range", ("", ""))
         export_raw_df = prepared_export["raw_df"] if prepared_export else prepared["raw_df"]
         export_summary_df = prepared_export["summary_df"] if prepared_export else prepared["summary_df"]
-        report_sheets, report_sheet_order = _build_report_sheets_compat(prepared_export)
         excel_bytes, excel_name = data_processor.build_excel_report(
             raw_df=export_raw_df,
             summary_df=export_summary_df,
@@ -399,53 +384,20 @@ def main() -> None:
             config=config,
         )
 
-        st.subheader("Таблицы (как в Excel)")
-        campaign_filter_source = report_sheets.get("Кампании")
-        selected_campaigns: list[str] = []
-        if campaign_filter_source is None:
-            campaign_filter_source = report_sheets.get("Данные")
+        st.subheader("Таблица данных")
+        table_df = prepared["table_df"].copy()
 
-        if campaign_filter_source is not None and not campaign_filter_source.empty:
-            if "ID кампании" in campaign_filter_source.columns:
-                campaign_series = campaign_filter_source["ID кампании"]
-            elif "campaign_id" in campaign_filter_source.columns:
-                campaign_series = campaign_filter_source["campaign_id"]
-            else:
-                campaign_series = None
-
-            if campaign_series is not None:
-                campaign_ids = campaign_series.dropna().astype(str).drop_duplicates().tolist()
-            else:
-                campaign_ids = []
-
-        else:
-            campaign_ids = []
-
-        if campaign_ids:
+        if not table_df.empty and "ID кампании" in table_df.columns:
+            campaign_ids = table_df["ID кампании"].dropna().astype(str).drop_duplicates().tolist()
             selected_campaigns = st.multiselect(
                 "Фильтр по кампаниям",
                 options=campaign_ids,
                 default=[],
             )
+            if selected_campaigns:
+                table_df = table_df[table_df["ID кампании"].astype(str).isin(selected_campaigns)].copy()
 
-        if not report_sheet_order:
-            st.info("Нет данных.")
-            return
-
-        tabs = st.tabs(report_sheet_order)
-        for tab, sheet_name in zip(tabs, report_sheet_order):
-            with tab:
-                table_df = report_sheets.get(sheet_name)
-                if table_df is None or table_df.empty:
-                    st.info("Нет данных.")
-                    continue
-                filtered_df = table_df
-                if selected_campaigns:
-                    if "ID кампании" in filtered_df.columns:
-                        filtered_df = filtered_df[filtered_df["ID кампании"].astype(str).isin(selected_campaigns)].copy()
-                    elif "campaign_id" in filtered_df.columns:
-                        filtered_df = filtered_df[filtered_df["campaign_id"].astype(str).isin(selected_campaigns)].copy()
-                st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
 
 
 
