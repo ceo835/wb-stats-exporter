@@ -154,7 +154,6 @@ def _render_theme_css() -> None:
 def _init_state() -> None:
     """Initialize Streamlit session keys."""
     st.session_state.setdefault("prepared_view", None)
-    st.session_state.setdefault("prepared_export", None)
     st.session_state.setdefault("raw_rows", None)
     st.session_state.setdefault("last_update", None)
     st.session_state.setdefault("last_range", ("", ""))
@@ -213,16 +212,17 @@ def main() -> None:
     with col_filter_3:
         filter_zero_spend = st.checkbox("Скрыть нулевые товары (экран)", value=False)
     with col_filter_4:
+        table_mode_labels = list(TABLE_MODE_LABEL_TO_VALUE.keys())
         table_mode_label = st.selectbox(
             "Таблица",
-            list(TABLE_MODE_LABEL_TO_VALUE.keys()),
-            index=1,
+            table_mode_labels,
+            index=table_mode_labels.index("Все строки"),
         )
         table_mode = TABLE_MODE_LABEL_TO_VALUE[table_mode_label]
     with col_filter_5:
         aggregate_items = st.checkbox("Объединять товары", value=True)
     with col_filter_6:
-        st.caption("Экспорт: все данные (включая нулевые), как в WB.")
+        st.caption("Экспорт и облако: как на экране (те же фильтры).")
     full_scan_all_campaigns = False
     if show_full_scan_option:
         with col_filter_7:
@@ -296,19 +296,10 @@ def main() -> None:
         )
         st.session_state["prepared_view"] = prepared_view
 
-        prepared_export = data_processor.prepare_data(
-            rows=raw_rows,
-            filter_zero_spend=False,
-            table_mode="all",
-            aggregate_items=False,
-        )
-        st.session_state["prepared_export"] = prepared_export
-
         for warning in prepared_view.get("warnings", []):
             logger.warning(warning)
 
     prepared = st.session_state.get("prepared_view")
-    prepared_export = st.session_state.get("prepared_export")
     last_update = st.session_state.get("last_update")
     _render_status(last_update)
 
@@ -319,8 +310,8 @@ def main() -> None:
         _render_metrics(metrics)
 
         start_used, end_used = st.session_state.get("last_range", ("", ""))
-        export_raw_df = prepared_export["raw_df"] if prepared_export else prepared["raw_df"]
-        export_summary_df = prepared_export["summary_df"] if prepared_export else prepared["summary_df"]
+        export_raw_df = prepared["raw_df"]
+        export_summary_df = prepared["summary_df"]
         excel_bytes, excel_name = data_processor.build_excel_report(
             raw_df=export_raw_df,
             summary_df=export_summary_df,
