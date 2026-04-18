@@ -1,4 +1,4 @@
-"""Optional Google Sheets export for Streamlit app."""
+﻿"""Optional Google Sheets export for Streamlit app."""
 
 from __future__ import annotations
 
@@ -24,8 +24,10 @@ from data_processor import (
 )
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-LOG_SHEET_NAME = "Логи"
+LOG_SHEET_NAME = "Р›РѕРіРё"
 SHEETS_WRITE_CHUNK_SIZE = 2000
+ADS_EXPORT_SHEET_PREFIX_ENV = "ADS_GOOGLE_EXPORT_PREFIX"
+DEFAULT_ADS_EXPORT_SHEET_PREFIX = "AdsStats"
 
 
 @dataclass
@@ -73,21 +75,21 @@ class GoogleSheetsExporter:
         if not self.config.enabled:
             raise RuntimeError("Google Sheets integration is not configured.")
 
-        base_title = f"{start_date}_{end_date}"
+        base_title = self._report_sheet_base_title(start_date=start_date, end_date=end_date)
         sheet_title = self._make_unique_sheet_title(base_title)
         self._create_sheet(sheet_title)
 
         raw_export, summary_export = self._prepare_export_frames(raw_df, summary_df)
         values: list[list[Any]] = []
 
-        values.append(["Данные (сырые)"])
+        values.append(["Р”Р°РЅРЅС‹Рµ (СЃС‹СЂС‹Рµ)"])
         values.append([str(col) for col in raw_export.columns.tolist()])
         values.extend(
             [[self._serialize(cell) for cell in row] for row in raw_export.itertuples(index=False, name=None)]
         )
 
         values.append([])
-        values.append(["Сводные"])
+        values.append(["РЎРІРѕРґРЅС‹Рµ"])
         values.append([str(col) for col in summary_export.columns.tolist()])
         values.extend(
             [[self._serialize(cell) for cell in row] for row in summary_export.itertuples(index=False, name=None)]
@@ -95,7 +97,7 @@ class GoogleSheetsExporter:
 
         self._write_values_chunked(sheet_title=sheet_title, values=values)
 
-        self.logger.info("Данные сохранены в Google Sheets, лист: %s", sheet_title)
+        self.logger.info("Р”Р°РЅРЅС‹Рµ СЃРѕС…СЂР°РЅРµРЅС‹ РІ Google Sheets, Р»РёСЃС‚: %s", sheet_title)
         return sheet_title
 
     def _write_values_chunked(
@@ -131,8 +133,8 @@ class GoogleSheetsExporter:
         preferred_raw = [column for column in RAW_DISPLAY_COLUMNS if column in raw_export.columns]
         extra_raw = [column for column in raw_export.columns if column not in preferred_raw]
         raw_export = raw_export[preferred_raw + extra_raw].rename(columns=RAW_RENAME_MAP)
-        if "Тип строки" in raw_export.columns:
-            raw_export["Тип строки"] = raw_export["Тип строки"].replace(ROW_TYPE_DISPLAY_MAP)
+        if "РўРёРї СЃС‚СЂРѕРєРё" in raw_export.columns:
+            raw_export["РўРёРї СЃС‚СЂРѕРєРё"] = raw_export["РўРёРї СЃС‚СЂРѕРєРё"].replace(ROW_TYPE_DISPLAY_MAP)
 
         summary_export = summary_df.copy()
         if summary_export.empty:
@@ -152,7 +154,7 @@ class GoogleSheetsExporter:
         message: str = "",
         sheet_title: str = "",
     ) -> None:
-        """Append metadata row into `Логи` sheet."""
+        """Append metadata row into `Р›РѕРіРё` sheet."""
         self._ensure_log_sheet()
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -220,6 +222,13 @@ class GoogleSheetsExporter:
         while f"{alt_title}_{number}" in titles:
             number += 1
         return f"{alt_title}_{number}"
+    @staticmethod
+    def _report_sheet_base_title(start_date: str, end_date: str) -> str:
+        prefix = os.getenv(ADS_EXPORT_SHEET_PREFIX_ENV, DEFAULT_ADS_EXPORT_SHEET_PREFIX).strip()
+        base_title = f"{start_date}_{end_date}"
+        if not prefix:
+            return base_title
+        return f"{prefix}_{base_title}"
 
     def _spreadsheet_metadata(self) -> dict[str, Any]:
         return self.service.spreadsheets().get(
@@ -280,7 +289,7 @@ def try_save_to_google_sheets(
     """Save report to Google Sheets if configured. Returns status and message."""
     config = load_google_config()
     if not config.enabled:
-        return False, "GOOGLE_CREDENTIALS_FILE или GOOGLE_SPREADSHEET_ID не заполнены."
+        return False, "GOOGLE_CREDENTIALS_FILE РёР»Рё GOOGLE_SPREADSHEET_ID РЅРµ Р·Р°РїРѕР»РЅРµРЅС‹."
 
     try:
         exporter = GoogleSheetsExporter(config=config, logger=logger)
@@ -291,11 +300,11 @@ def try_save_to_google_sheets(
             start_date=start_date,
             end_date=end_date,
             sheet_title=sheet_title,
-            message="Данные записаны успешно.",
+            message="source=ads_statistics; export saved successfully.",
         )
         return True, f"Данные сохранены в лист: {sheet_title}"
     except (HttpError, OSError, RuntimeError) as exc:
-        logger.warning("Ошибка выгрузки в Google Sheets: %s", exc)
+        logger.warning("РћС€РёР±РєР° РІС‹РіСЂСѓР·РєРё РІ Google Sheets: %s", exc)
         try:
             config = load_google_config()
             if config.enabled:
@@ -305,8 +314,10 @@ def try_save_to_google_sheets(
                     rows_count=len(raw_df),
                     start_date=start_date,
                     end_date=end_date,
-                    message=str(exc),
+                    message=f"source=ads_statistics; error={exc}",
                 )
         except Exception:
-            logger.warning("Не удалось записать ошибку в лист Логи.")
+            logger.warning("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїРёСЃР°С‚СЊ РѕС€РёР±РєСѓ РІ Р»РёСЃС‚ Р›РѕРіРё.")
         return False, str(exc)
+
+

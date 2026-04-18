@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -17,7 +18,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import data_processor
-from google_sheets import is_google_sheets_configured, try_save_to_google_sheets
+from google_sheets import is_google_sheets_configured
 from logger_utils import get_log_level, setup_logging
 from services.positions_groups import POSITION_CATEGORY_ORDER, POSITION_CATEGORY_OTHER, classify_position_category
 from services.positions_models import CollectorState
@@ -226,11 +227,55 @@ def _sync_streamlit_secrets_to_env() -> None:
         target = Path(credentials_path)
 
         if isinstance(raw, dict):
-            target.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+            payload = _normalize_google_credentials_payload(raw)
+            target.write_text(payload, encoding="utf-8")
             os.environ["GOOGLE_CREDENTIALS_FILE"] = str(target)
         elif isinstance(raw, str) and raw.strip():
-            target.write_text(raw.strip(), encoding="utf-8")
+            payload = _normalize_google_credentials_payload(raw)
+            target.write_text(payload, encoding="utf-8")
             os.environ["GOOGLE_CREDENTIALS_FILE"] = str(target)
+
+
+def _normalize_google_credentials_payload(raw: Any) -> str:
+    """Normalize service-account JSON from Streamlit secrets to a valid JSON file."""
+    if isinstance(raw, dict):
+        payload = dict(raw)
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            raise ValueError("GOOGLE_CREDENTIALS_JSON is empty.")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            repaired = _repair_google_credentials_json(text)
+            payload = json.loads(repaired)
+
+    if not isinstance(payload, dict):
+        raise ValueError("GOOGLE_CREDENTIALS_JSON must be a JSON object.")
+
+    private_key = payload.get("private_key")
+    if isinstance(private_key, str):
+        payload["private_key"] = private_key.replace("\\n", "\n")
+
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _repair_google_credentials_json(text: str) -> str:
+    """Repair malformed JSON where private_key contains literal line breaks."""
+    pattern = r'("private_key"\s*:\s*")(.+?)(")'
+    match = re.search(pattern, text, flags=re.DOTALL)
+    if not match:
+        raise ValueError("GOOGLE_CREDENTIALS_JSON is not valid JSON.")
+
+    key_value = match.group(2)
+    repaired_key = (
+        key_value
+        .replace("\\r\\n", "\\n")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+    )
+    return text[: match.start(2)] + repaired_key + text[match.end(2) :]
 
 
 def _get_logger() -> logging.Logger:
@@ -540,29 +585,7 @@ def _render_ads_tab(logger: logging.Logger) -> None:
         key="ad_download_excel",
     )
 
-    save_disabled = not is_google_sheets_configured()
-    save_clicked = actions_col3.button(
-        "☁️ Сохранить в облако",
-        disabled=save_disabled,
-        use_container_width=True,
-        key="ad_save_cloud",
-    )
-    if save_disabled:
-        actions_col3.caption("Google Sheets не настроен.")
-
-    if save_clicked:
-        with st.spinner("Сохранение в Google Sheets..."):
-            ok, message = try_save_to_google_sheets(
-                raw_df=export_raw_df,
-                summary_df=export_summary_df,
-                start_date=start_used,
-                end_date=end_used,
-                logger=logger,
-            )
-            if ok:
-                st.success(message)
-            else:
-                st.warning(f"Не удалось сохранить в облако: {message}")
+    actions_col3.caption("Выгрузка рекламной статистики в Google Sheets отключена. Используйте Excel.")
 
     config = {
         "displaylogo": False,
