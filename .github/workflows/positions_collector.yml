@@ -49,11 +49,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Create credentials file
-        if: ${{ secrets.GOOGLE_CREDENTIALS_JSON != '' }}
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: |
-          cat << 'EOF' > credentials.json
-          ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          EOF
+          if [ -n "$GOOGLE_CREDENTIALS_JSON" ]; then
+            printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
+          else
+            echo "GOOGLE_CREDENTIALS_JSON secret is empty."
+            exit 1
+          fi
 
       - name: Run positions collector
         env:
