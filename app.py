@@ -320,7 +320,6 @@ def _fetch_rows_cached(
         client.close()
 
 
-@st.cache_data(show_spinner=False, ttl=120)
 def _load_positions_state_cached(
     log_level: str,
     spreadsheet_id: str,
@@ -334,7 +333,6 @@ def _load_positions_state_cached(
     return service.get_collector_state().as_mapping()
 
 
-@st.cache_data(show_spinner=False, ttl=120)
 def _load_positions_rows_cached(
     log_level: str,
     spreadsheet_id: str,
@@ -347,6 +345,10 @@ def _load_positions_rows_cached(
     service.ensure_base_sheets()
     frame = service.load_positions_raw()
     return frame.to_dict(orient="records")
+
+
+_load_positions_state_cached.clear = lambda: None  # type: ignore[attr-defined]
+_load_positions_rows_cached.clear = lambda: None  # type: ignore[attr-defined]
 
 
 def _load_positions_state_resilient(
