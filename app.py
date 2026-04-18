@@ -160,20 +160,21 @@ def _format_row_error(status: Any, data_source: Any, error_msg: Any) -> str:
 
 
 def _load_streamlit_secrets() -> dict[str, Any]:
-    """Safely load Streamlit secrets (without warnings when file is absent)."""
-    local_paths = [
-        Path.home() / ".streamlit" / "secrets.toml",
-        Path.cwd() / ".streamlit" / "secrets.toml",
-    ]
-    if not any(path.exists() for path in local_paths):
-        return {}
-
+    """Safely load Streamlit secrets for both local and cloud runtimes."""
     try:
         return dict(st.secrets)
     except FileNotFoundError:
         return {}
     except Exception:
         return {}
+
+
+def _format_exception_text(exc: Exception) -> str:
+    """Return a non-empty diagnostic string for UI errors."""
+    text = str(exc).strip()
+    if text:
+        return text
+    return type(exc).__name__
 
 
 def _get_setting(name: str, default: str = "") -> str:
@@ -778,7 +779,7 @@ def _render_positions_tab(logger: logging.Logger) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка чтения состояния коллектора позиций.")
-        st.error(f"Не удалось загрузить статус коллектора: {exc}")
+        st.error(f"Не удалось загрузить статус коллектора: {_format_exception_text(exc)}")
         return
 
     trigger_disabled = state.running or cooldown_left > 0
@@ -811,7 +812,7 @@ def _render_positions_tab(logger: logging.Logger) -> None:
         raw_rows = _load_positions_rows_cached(log_level, spreadsheet_id, state_sheet_name, raw_sheet_name)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка чтения сырых позиций.")
-        st.error(f"Не удалось загрузить данные позиций: {exc}")
+        st.error(f"Не удалось загрузить данные позиций: {_format_exception_text(exc)}")
         return
 
     frame = _prepare_positions_dataframe(raw_rows)
