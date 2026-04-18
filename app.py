@@ -349,6 +349,34 @@ def _load_positions_rows_cached(
     return frame.to_dict(orient="records")
 
 
+def _load_positions_state_resilient(
+    log_level: str,
+    spreadsheet_id: str,
+    state_sheet: str,
+    raw_sheet: str,
+) -> dict[str, str]:
+    """Retry positions state load once after clearing Streamlit cache."""
+    try:
+        return _load_positions_state_cached(log_level, spreadsheet_id, state_sheet, raw_sheet)
+    except Exception:
+        _load_positions_state_cached.clear()
+        return _load_positions_state_cached(log_level, spreadsheet_id, state_sheet, raw_sheet)
+
+
+def _load_positions_rows_resilient(
+    log_level: str,
+    spreadsheet_id: str,
+    state_sheet: str,
+    raw_sheet: str,
+) -> list[dict[str, Any]]:
+    """Retry positions raw rows load once after clearing Streamlit cache."""
+    try:
+        return _load_positions_rows_cached(log_level, spreadsheet_id, state_sheet, raw_sheet)
+    except Exception:
+        _load_positions_rows_cached.clear()
+        return _load_positions_rows_cached(log_level, spreadsheet_id, state_sheet, raw_sheet)
+
+
 def _positions_cache_context() -> tuple[str, str, str]:
     """Return current Sheets context so Streamlit cache invalidates on config change."""
     return (
@@ -775,7 +803,7 @@ def _render_positions_tab(logger: logging.Logger) -> None:
 
     try:
         state = CollectorState.from_mapping(
-            _load_positions_state_cached(log_level, spreadsheet_id, state_sheet_name, raw_sheet_name)
+            _load_positions_state_resilient(log_level, spreadsheet_id, state_sheet_name, raw_sheet_name)
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка чтения состояния коллектора позиций.")
@@ -809,7 +837,7 @@ def _render_positions_tab(logger: logging.Logger) -> None:
     _render_positions_status(state)
 
     try:
-        raw_rows = _load_positions_rows_cached(log_level, spreadsheet_id, state_sheet_name, raw_sheet_name)
+        raw_rows = _load_positions_rows_resilient(log_level, spreadsheet_id, state_sheet_name, raw_sheet_name)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка чтения сырых позиций.")
         st.error(f"Не удалось загрузить данные позиций: {_format_exception_text(exc)}")
