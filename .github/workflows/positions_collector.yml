@@ -3,6 +3,7 @@ name: Positions Collector
 on:
   schedule:
     - cron: "*/15 * * * *" # every 15 minutes (trigger-based run)
+    - cron: "15 2 * * *" # daily at 05:15 Moscow: collect previous day
   workflow_dispatch:
     inputs:
       force:
@@ -79,6 +80,12 @@ jobs:
           MAX_PAIRS_ARG="0"
           DATE_FROM_ARG=""
           DATE_TO_ARG=""
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "15 2 * * *" ]; then
+            YESTERDAY="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
+            FORCE_ARG="--force"
+            DATE_FROM_ARG="--date-from $YESTERDAY"
+            DATE_TO_ARG="--date-to $YESTERDAY"
+          fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
             FORCE_ARG="--force"
           fi

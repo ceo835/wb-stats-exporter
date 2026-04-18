@@ -590,10 +590,18 @@ class PositionsSheetsService:
             raise RuntimeError("Google Sheets credentials or spreadsheet id is empty.")
         if not os.path.isfile(self.credentials_file):
             raise FileNotFoundError(f"Credentials file not found: {self.credentials_file}")
-        credentials = service_account.Credentials.from_service_account_file(
-            self.credentials_file,
-            scopes=SCOPES,
-        )
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                self.credentials_file,
+                scopes=SCOPES,
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).strip()
+            if "EndOfStreamError" in type(exc).__name__ or "EndOfStreamError" in message:
+                raise RuntimeError(
+                    "Google credentials invalid: private_key in GOOGLE_CREDENTIALS_JSON is truncated or malformed."
+                ) from exc
+            raise
         return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
     def _execute_request(self, request: Any, operation: str) -> Any:

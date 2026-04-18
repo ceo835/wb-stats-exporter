@@ -178,9 +178,17 @@ class GoogleSheetsExporter:
                 f"GOOGLE_CREDENTIALS_FILE not found: {self.config.credentials_file}"
             )
 
-        credentials = service_account.Credentials.from_service_account_file(
-            self.config.credentials_file, scopes=SCOPES
-        )
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                self.config.credentials_file, scopes=SCOPES
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).strip()
+            if "EndOfStreamError" in type(exc).__name__ or "EndOfStreamError" in message:
+                raise RuntimeError(
+                    "Google credentials invalid: private_key in GOOGLE_CREDENTIALS_JSON is truncated or malformed."
+                ) from exc
+            raise
         return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
     def _ensure_log_sheet(self) -> None:
