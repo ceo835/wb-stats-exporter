@@ -7,5 +7,4 @@ textColor = "#0F172A"
 
 [server]
 headless = true
-enableCORS = false
-python_version = "3.11"
+enableCORS = true
