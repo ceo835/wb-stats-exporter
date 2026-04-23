@@ -38,7 +38,11 @@ class WBContentNameResolver:
     @classmethod
     def from_env(cls, logger: logging.Logger) -> "WBContentNameResolver":
         """Build resolver from environment."""
-        token = os.getenv("WB_CONTENT_TOKEN", "").strip() or os.getenv("WB_TOKEN", "").strip()
+        token = (
+            os.getenv("WB_CONTENT_TOKEN", "").strip()
+            or os.getenv("WB_API_TOKEN", "").strip()
+            or os.getenv("WB_TOKEN", "").strip()
+        )
         return cls(
             logger=logger,
             token=token,

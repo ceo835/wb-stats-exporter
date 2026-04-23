@@ -230,7 +230,6 @@ class MPStatsClient:
     ) -> tuple[str, str, Optional[dict[str, Any]]]:
         exact_fallback: Optional[tuple[str, dict[str, Any]]] = None
         norm_fallback: Optional[tuple[str, dict[str, Any]]] = None
-        partial_fallback: Optional[tuple[str, dict[str, Any]]] = None
 
         # 1) exact query match (prefer rows with a real position)
         for api_query, data in words_dict.items():
@@ -254,39 +253,10 @@ class MPStatsClient:
                 if norm_fallback is None:
                     norm_fallback = (query_text, data)
 
-        # 3) partial (prefer rows with a real position)
-        if normalized_user_query:
-            for api_query, data in words_dict.items():
-                if not isinstance(data, dict):
-                    continue
-                if normalized_user_query in self._normalize_query(api_query):
-                    query_text = str(api_query).strip()
-                    if self._extract_best_rank_for_match(data) < 999999:
-                        return query_text, "partial", data
-                    if partial_fallback is None:
-                        partial_fallback = (query_text, data)
-
-        # 4) best position
-        best_query = ""
-        best_row: Optional[dict[str, Any]] = None
-        best_rank = 999999
-        for api_query, data in words_dict.items():
-            if not isinstance(data, dict):
-                continue
-            rank = self._extract_best_rank_for_match(data)
-            if rank < best_rank:
-                best_rank = rank
-                best_query = str(api_query).strip()
-                best_row = data
-        if best_row is not None:
-            return best_query, "best_position", best_row
-
         if exact_fallback is not None:
             return exact_fallback[0], "exact", exact_fallback[1]
         if norm_fallback is not None:
             return norm_fallback[0], "norm_query", norm_fallback[1]
-        if partial_fallback is not None:
-            return partial_fallback[0], "partial", partial_fallback[1]
         return "", "not_found", None
 
     def _select_best_match_in_list(
@@ -300,7 +270,6 @@ class MPStatsClient:
 
         exact_fallback: Optional[tuple[str, dict[str, Any]]] = None
         norm_fallback: Optional[tuple[str, dict[str, Any]]] = None
-        partial_fallback: Optional[tuple[str, dict[str, Any]]] = None
 
         # 1) exact (prefer rows with a real position)
         for row in rows:
@@ -320,34 +289,10 @@ class MPStatsClient:
                 if norm_fallback is None:
                     norm_fallback = (query_text, row)
 
-        # 3) partial (prefer rows with a real position)
-        if normalized_user_query:
-            for row in rows:
-                query_text = str(row.get("word") or row.get("query") or row.get("text") or "").strip()
-                if normalized_user_query in self._normalize_query(query_text):
-                    if self._extract_best_rank_for_match(row) < 999999:
-                        return query_text, "partial", row
-                    if partial_fallback is None:
-                        partial_fallback = (query_text, row)
-
-        # 4) best position
-        best_row: Optional[dict[str, Any]] = None
-        best_rank = 999999
-        for row in rows:
-            rank = self._extract_best_rank_for_match(row)
-            if rank < best_rank:
-                best_rank = rank
-                best_row = row
-        if best_row is not None:
-            best_query = str(best_row.get("word") or best_row.get("query") or best_row.get("text") or "").strip()
-            return best_query, "best_position", best_row
-
         if exact_fallback is not None:
             return exact_fallback[0], "exact", exact_fallback[1]
         if norm_fallback is not None:
             return norm_fallback[0], "norm_query", norm_fallback[1]
-        if partial_fallback is not None:
-            return partial_fallback[0], "partial", partial_fallback[1]
         return "", "not_found", None
 
     def _fetch_keywords_payload(self, nm_id: int, d1: str, d2: str) -> tuple[Optional[dict[str, Any]], str]:

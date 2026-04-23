@@ -19,7 +19,8 @@ streamlit run app.py
 - `GOOGLE_SPREADSHEET_ID`
 - `MPSTATS_API_TOKEN`
 - `WB_ANALYTICS_TOKEN` (опционально)
-- `WB_CONTENT_TOKEN` (опционально, иначе используется `WB_TOKEN`)
+- `WB_CONTENT_TOKEN` (optional, preferred token for Content API)
+- `WB_API_TOKEN` (optional alias for `WB_CONTENT_TOKEN`)
 
 Полный список доступен в `.env.example`.
 

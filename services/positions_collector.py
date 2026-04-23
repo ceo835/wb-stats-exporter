@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from .mpstats_service import MPStatsClient, MPStatsSearchResult
 from .positions_gsheets_service import PositionsSheetsService
 from .positions_models import PositionRecord
-from .wb_analytics_service import WBAnalyticsClient
+from .wb_analytics_service import WBAnalyticsClient, WBAnalyticsSearchResult
 from .wb_content_service import WBContentNameResolver
 
 DEFAULT_TIMEZONE = "Europe/Moscow"
@@ -197,33 +197,33 @@ class PositionsCollector:
         if not self.wb_analytics_client:
             return self._collect_from_mpstats(nm_id=nm_id, user_query=user_query, collection_date=collection_date)
 
-        wb_position, wb_status, wb_error, _wb_raw_payload = self.wb_analytics_client.fetch_position(
+        wb_result: WBAnalyticsSearchResult = self.wb_analytics_client.fetch_search_result(
             nm_id=nm_id,
             query=user_query,
             target_date=collection_date,
         )
-        normalized_wb_status = self._normalize_wb_status(wb_status)
-        if normalized_wb_status == "found":
+        matched_query = str(wb_result.matched_query or "").strip() or user_query
+        if wb_result.status == "found":
             return {
-                "position": wb_position,
+                "position": wb_result.position,
                 "organic_position": None,
-                "boost_position": wb_position,
-                "matched_query": user_query,
-                "match_type": "exact",
-                "traffic_volume": None,
+                "boost_position": None,
+                "matched_query": matched_query,
+                "match_type": wb_result.match_type,
+                "traffic_volume": wb_result.traffic_volume,
                 "status": "found",
                 "data_source": "wb_analytics",
                 "error_msg": "",
             }
 
-        if normalized_wb_status == "not_found" and not self.wb_fallback_on_not_found:
+        if wb_result.status == "not_found" and not self.wb_fallback_on_not_found:
             return {
                 "position": None,
                 "organic_position": None,
                 "boost_position": None,
-                "matched_query": user_query,
-                "match_type": "exact",
-                "traffic_volume": None,
+                "matched_query": matched_query,
+                "match_type": wb_result.match_type,
+                "traffic_volume": wb_result.traffic_volume,
                 "status": "not_found",
                 "data_source": "wb_analytics",
                 "error_msg": "",
@@ -234,11 +234,11 @@ class PositionsCollector:
             user_query=user_query,
             collection_date=collection_date,
         )
-        if normalized_wb_status == "source_error" and mpstats_result["status"] == "source_error":
-            if wb_error and mpstats_result["error_msg"]:
-                mpstats_result["error_msg"] = f"WB: {wb_error}; MPSTATS: {mpstats_result['error_msg']}"
-            elif wb_error and not mpstats_result["error_msg"]:
-                mpstats_result["error_msg"] = f"WB: {wb_error}"
+        if wb_result.status == "source_error" and mpstats_result["status"] == "source_error":
+            if wb_result.error_msg and mpstats_result["error_msg"]:
+                mpstats_result["error_msg"] = f"WB: {wb_result.error_msg}; MPSTATS: {mpstats_result['error_msg']}"
+            elif wb_result.error_msg and not mpstats_result["error_msg"]:
+                mpstats_result["error_msg"] = f"WB: {wb_result.error_msg}"
         return mpstats_result
 
     def _collect_from_mpstats(self, nm_id: int, user_query: str, collection_date: str) -> dict[str, Any]:
@@ -247,26 +247,18 @@ class PositionsCollector:
             query=user_query,
             target_date=collection_date,
         )
+        matched_query = str(result.matched_query or "").strip() or str(user_query or "").strip()
         return {
             "position": result.position,
             "organic_position": result.organic_position,
             "boost_position": result.boost_position,
-            "matched_query": result.matched_query,
+            "matched_query": matched_query,
             "match_type": result.match_type,
             "traffic_volume": result.traffic_volume,
             "status": result.status,
             "data_source": "mpstats",
             "error_msg": result.error_msg,
         }
-
-    @staticmethod
-    def _normalize_wb_status(wb_status: str) -> str:
-        key = str(wb_status or "").strip().lower()
-        if key == "ok":
-            return "found"
-        if key == "not_found":
-            return "not_found"
-        return "source_error"
 
     @staticmethod
     def _to_bool(value: Any) -> bool:

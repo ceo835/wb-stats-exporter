@@ -159,6 +159,34 @@ def _format_row_error(status: Any, data_source: Any, error_msg: Any) -> str:
     return text
 
 
+def _format_rank(value: Any) -> str:
+    """Render nullable rank as user-facing text."""
+    if pd.isna(value):
+        return "—"
+    return str(int(value))
+
+
+def _rank_bucket(value: Any) -> str:
+    """Bucketize rank for quick visual interpretation."""
+    if pd.isna(value):
+        return "🔴 51+ / не найдено"
+    numeric = int(value)
+    if numeric <= 10:
+        return "🟢 1-10"
+    if numeric <= 50:
+        return "🟡 11-50"
+    return "🔴 51+ / не найдено"
+
+
+def _format_top_and_avg(series: pd.Series) -> str:
+    """Render Top-10 count and average rank for one channel."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    top10_count = int((numeric.notna() & (numeric <= 10)).sum())
+    avg_rank = numeric.dropna().mean()
+    avg_text = "—" if pd.isna(avg_rank) else f"{float(avg_rank):.1f}"
+    return f"{top10_count} / {avg_text}"
+
+
 def _load_streamlit_secrets() -> dict[str, Any]:
     """Safely load Streamlit secrets for both local and cloud runtimes."""
     try:
@@ -201,6 +229,7 @@ def _sync_streamlit_secrets_to_env() -> None:
         "WB_ANALYTICS_POSITION_URL",
         "WB_FALLBACK_ON_NOT_FOUND",
         "WB_CONTENT_TOKEN",
+        "WB_API_TOKEN",
         "WB_CONTENT_URL",
         "MY_NM_IDS",
         "POSITIONS_MY_NM_IDS",
@@ -221,6 +250,12 @@ def _sync_streamlit_secrets_to_env() -> None:
     ):
         if key in secrets and str(secrets[key]).strip():
             os.environ[key] = str(secrets[key]).strip()
+
+
+    if not os.getenv("WB_CONTENT_TOKEN", "").strip():
+        api_token = os.getenv("WB_API_TOKEN", "").strip()
+        if api_token:
+            os.environ["WB_CONTENT_TOKEN"] = api_token
 
     if "GOOGLE_CREDENTIALS_JSON" in secrets:
         raw = secrets["GOOGLE_CREDENTIALS_JSON"]
@@ -718,6 +753,13 @@ def _prepare_positions_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "status",
                 "data_source",
                 "error_msg",
+                "wb_position",
+                "wb_position_previous",
+                "wb_position_change",
+                "organic_position_previous",
+                "organic_position_change",
+                "boost_position_previous",
+                "boost_position_change",
                 "position_previous",
                 "position_change",
                 "category",
@@ -761,6 +803,9 @@ def _prepare_positions_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     frame["position"] = pd.to_numeric(frame.get("position"), errors="coerce").astype("Int64")
     frame["organic_position"] = pd.to_numeric(frame.get("organic_position"), errors="coerce").astype("Int64")
     frame["boost_position"] = pd.to_numeric(frame.get("boost_position"), errors="coerce").astype("Int64")
+    frame.loc[frame["data_source"] == "wb_analytics", "organic_position"] = pd.NA
+    frame.loc[frame["data_source"] == "wb_analytics", "boost_position"] = pd.NA
+    frame["wb_position"] = frame["position"].where(frame["data_source"] == "wb_analytics")
     frame["traffic_volume"] = pd.to_numeric(frame.get("traffic_volume"), errors="coerce").astype("Int64")
     frame = frame.dropna(subset=["nm_id"]).copy()
     frame["nm_id"] = frame["nm_id"].astype(int)
@@ -774,8 +819,20 @@ def _prepare_positions_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     )
 
     history = frame.sort_values(by=["nm_id", "user_query", "date", "collected_at"], ascending=[True, True, True, True]).copy()
+    history["wb_position_previous"] = history.groupby(["nm_id", "user_query"])["wb_position"].shift(1)
+    history["wb_position_change"] = history["wb_position"] - history["wb_position_previous"]
+    history["organic_position_previous"] = history.groupby(["nm_id", "user_query"])["organic_position"].shift(1)
+    history["organic_position_change"] = history["organic_position"] - history["organic_position_previous"]
+    history["boost_position_previous"] = history.groupby(["nm_id", "user_query"])["boost_position"].shift(1)
+    history["boost_position_change"] = history["boost_position"] - history["boost_position_previous"]
     history["position_previous"] = history.groupby(["nm_id", "user_query"])["position"].shift(1)
     history["position_change"] = history["position"] - history["position_previous"]
+    history["wb_position_previous"] = pd.to_numeric(history["wb_position_previous"], errors="coerce").astype("Int64")
+    history["wb_position_change"] = pd.to_numeric(history["wb_position_change"], errors="coerce").astype("Int64")
+    history["organic_position_previous"] = pd.to_numeric(history["organic_position_previous"], errors="coerce").astype("Int64")
+    history["organic_position_change"] = pd.to_numeric(history["organic_position_change"], errors="coerce").astype("Int64")
+    history["boost_position_previous"] = pd.to_numeric(history["boost_position_previous"], errors="coerce").astype("Int64")
+    history["boost_position_change"] = pd.to_numeric(history["boost_position_change"], errors="coerce").astype("Int64")
     history["position_previous"] = pd.to_numeric(history["position_previous"], errors="coerce").astype("Int64")
     history["position_change"] = pd.to_numeric(history["position_change"], errors="coerce").astype("Int64")
 
@@ -918,6 +975,13 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             st.info("После скрытия строк без источника данных записей не осталось.")
             return
 
+    legacy_match_rows = int(filtered["match_type"].isin({"partial", "best_position"}).sum())
+    if legacy_match_rows > 0:
+        st.warning(
+            "В выборке есть строки, собранные старой логикой partial/best_position. "
+            "Чтобы убрать завышенные совпадения, запустите повторный сбор или backfill для нужного периода."
+        )
+
     latest_snapshot = (
         filtered.sort_values(by=["date", "collected_at"])
         .groupby(["nm_id", "user_query"], as_index=False)
@@ -942,18 +1006,17 @@ def _render_positions_tab(logger: logging.Logger) -> None:
     found_count = int((metrics_frame["status"] == "found").sum())
     not_found_count = int((metrics_frame["status"] == "not_found").sum())
     source_error_count = int((metrics_frame["status"] == "source_error").sum())
-    top10_count = int((metrics_frame["position"].notna() & (metrics_frame["position"] <= 10)).sum())
-    avg_position = metrics_frame["position"].dropna().mean()
-    avg_position_text = "—" if pd.isna(avg_position) else f"{float(avg_position):.1f}"
     found_pct = 0.0 if total_pairs == 0 else (found_count / total_pairs) * 100.0
     not_found_pct = 0.0 if total_pairs == 0 else (not_found_count / total_pairs) * 100.0
 
-    summary_cols = st.columns(5)
+    summary_cols = st.columns(7)
     summary_cols[0].metric("Всего строк", f"{total_pairs:,}".replace(",", " "))
     summary_cols[1].metric("✅ Найдено", f"{found_count:,} ({found_pct:.0f}%)".replace(",", " "))
     summary_cols[2].metric("❌ Не найдено", f"{not_found_count:,} ({not_found_pct:.0f}%)".replace(",", " "))
     summary_cols[3].metric("⚠️ Ошибки источника", f"{source_error_count:,}".replace(",", " "))
-    summary_cols[4].metric("🏆 Топ-10 / Средняя", f"{top10_count} / {avg_position_text}")
+    summary_cols[4].metric("WB: топ-10 / средняя", _format_top_and_avg(metrics_frame["wb_position"]))
+    summary_cols[5].metric("Органика: топ-10 / средняя", _format_top_and_avg(metrics_frame["organic_position"]))
+    summary_cols[6].metric("Буст: топ-10 / средняя", _format_top_and_avg(metrics_frame["boost_position"]))
 
     show_recommendations = st.checkbox(
         "Показывать подсказки по последнему замеру",
@@ -964,7 +1027,9 @@ def _render_positions_tab(logger: logging.Logger) -> None:
         recommendations: list[str] = []
         latest_not_found_count = int((latest_snapshot["status"] == "not_found").sum())
         latest_source_error_count = int((latest_snapshot["status"] == "source_error").sum())
-        latest_fallen_count = int((latest_snapshot["position_change"] > 0).sum())
+        latest_wb_fallen_count = int((latest_snapshot["wb_position_change"] > 0).sum())
+        latest_organic_fallen_count = int((latest_snapshot["organic_position_change"] > 0).sum())
+        latest_boost_fallen_count = int((latest_snapshot["boost_position_change"] > 0).sum())
 
         if latest_not_found_count > 0:
             recommendations.append(
@@ -974,9 +1039,17 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             recommendations.append(
                 f"{latest_source_error_count} строк с ошибкой источника: запустите проверку повторно позже."
             )
-        if latest_fallen_count > 0:
+        if latest_wb_fallen_count > 0:
             recommendations.append(
-                f"{latest_fallen_count} строк ухудшили позицию относительно прошлого замера."
+                f"{latest_wb_fallen_count} строк ухудшили официальную WB-позицию относительно прошлого замера."
+            )
+        if latest_organic_fallen_count > 0:
+            recommendations.append(
+                f"{latest_organic_fallen_count} строк ухудшили органическую позицию относительно прошлого замера."
+            )
+        if latest_boost_fallen_count > 0:
+            recommendations.append(
+                f"{latest_boost_fallen_count} строк ухудшили позицию в бусте относительно прошлого замера."
             )
 
         if recommendations:
@@ -988,19 +1061,15 @@ def _render_positions_tab(logger: logging.Logger) -> None:
     table_frame = filtered.copy()
     table_frame["date_display"] = table_frame["date"].apply(_format_user_date)
     table_frame["collected_at_display"] = table_frame["collected_at"].apply(_format_user_datetime)
-    table_frame["position_display"] = table_frame["position"].apply(lambda value: "—" if pd.isna(value) else int(value))
-    table_frame["organic_display"] = table_frame["organic_position"].apply(
-        lambda value: "—" if pd.isna(value) else int(value)
-    )
-    table_frame["boost_display"] = table_frame["boost_position"].apply(
-        lambda value: "—" if pd.isna(value) else int(value)
-    )
-    table_frame["position_numeric"] = pd.to_numeric(table_frame["position"], errors="coerce")
-    table_frame["position_bucket"] = table_frame["position_numeric"].apply(
-        lambda value: "🔴 51+ / не найдено"
-        if pd.isna(value) or int(value) > 50
-        else ("🟡 11-50" if int(value) > 10 else "🟢 1-10")
-    )
+    table_frame["wb_display"] = table_frame["wb_position"].apply(_format_rank)
+    table_frame["organic_display"] = table_frame["organic_position"].apply(_format_rank)
+    table_frame["boost_display"] = table_frame["boost_position"].apply(_format_rank)
+    table_frame["wb_numeric"] = pd.to_numeric(table_frame["wb_position"], errors="coerce")
+    table_frame["organic_numeric"] = pd.to_numeric(table_frame["organic_position"], errors="coerce")
+    table_frame["boost_numeric"] = pd.to_numeric(table_frame["boost_position"], errors="coerce")
+    table_frame["wb_bucket"] = table_frame["wb_numeric"].apply(_rank_bucket)
+    table_frame["organic_bucket"] = table_frame["organic_numeric"].apply(_rank_bucket)
+    table_frame["boost_bucket"] = table_frame["boost_numeric"].apply(_rank_bucket)
     table_frame["product_name_display"] = table_frame["product_name"].fillna("").astype(str).str.strip()
     table_frame.loc[table_frame["product_name_display"] == "", "product_name_display"] = "—"
     table_frame["category_display"] = table_frame["category"].fillna("").astype(str).str.strip()
@@ -1029,10 +1098,12 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             "user_query_display": "Запрос",
             "matched_query_display": "Совпавший запрос",
             "match_type_display": "Тип совпадения",
-            "position_display": "Позиция",
+            "wb_display": "WB позиция",
             "organic_display": "Органика",
             "boost_display": "Буст",
-            "position_bucket": "Оценка",
+            "wb_bucket": "Оценка WB",
+            "organic_bucket": "Оценка органики",
+            "boost_bucket": "Оценка буста",
             "traffic_display": "Трафик",
             "source_display": "Источник данных",
             "status_display": "Статус",
@@ -1046,11 +1117,19 @@ def _render_positions_tab(logger: logging.Logger) -> None:
     latest.loc[latest["category_display"] == "", "category_display"] = POSITION_CATEGORY_OTHER
     latest["date_display"] = latest["date"].apply(_format_user_date)
     latest["collected_at_display"] = latest["collected_at"].apply(_format_user_datetime)
-    latest["position_display"] = latest["position"].apply(lambda value: "—" if pd.isna(value) else int(value))
-    latest["position_previous_display"] = latest["position_previous"].apply(
-        lambda value: "—" if pd.isna(value) else int(value)
+    latest["wb_display"] = latest["wb_position"].apply(_format_rank)
+    latest["wb_previous_display"] = latest["wb_position_previous"].apply(_format_rank)
+    latest["wb_change_display"] = latest["wb_position_change"].apply(
+        lambda value: "—" if pd.isna(value) else f"{int(value):+d}"
     )
-    latest["position_change_display"] = latest["position_change"].apply(
+    latest["organic_display"] = latest["organic_position"].apply(_format_rank)
+    latest["organic_previous_display"] = latest["organic_position_previous"].apply(_format_rank)
+    latest["organic_change_display"] = latest["organic_position_change"].apply(
+        lambda value: "—" if pd.isna(value) else f"{int(value):+d}"
+    )
+    latest["boost_display"] = latest["boost_position"].apply(_format_rank)
+    latest["boost_previous_display"] = latest["boost_position_previous"].apply(_format_rank)
+    latest["boost_change_display"] = latest["boost_position_change"].apply(
         lambda value: "—" if pd.isna(value) else f"{int(value):+d}"
     )
     latest_table = latest.rename(
@@ -1060,7 +1139,9 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             "user_query": "Запрос",
             "date_display": "Дата",
             "collected_at_display": "Собрано",
-            "position_display": "Последняя позиция",
+            "wb_display": "Последняя WB-позиция",
+            "organic_display": "Последняя органика",
+            "boost_display": "Последний буст",
         }
     )
 
@@ -1071,9 +1152,15 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             "user_query",
             "date_display",
             "collected_at_display",
-            "position_display",
-            "position_previous_display",
-            "position_change_display",
+            "wb_display",
+            "wb_previous_display",
+            "wb_change_display",
+            "organic_display",
+            "organic_previous_display",
+            "organic_change_display",
+            "boost_display",
+            "boost_previous_display",
+            "boost_change_display",
         ]
     ].copy()
     latest_delta_view = latest_delta_view.rename(
@@ -1083,9 +1170,15 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             "user_query": "Запрос",
             "date_display": "Дата",
             "collected_at_display": "Собрано",
-            "position_display": "Позиция",
-            "position_previous_display": "Пред. позиция",
-            "position_change_display": "Изменение",
+            "wb_display": "WB позиция",
+            "wb_previous_display": "Пред. WB",
+            "wb_change_display": "Δ WB",
+            "organic_display": "Органика",
+            "organic_previous_display": "Пред. органика",
+            "organic_change_display": "Δ органики",
+            "boost_display": "Буст",
+            "boost_previous_display": "Пред. буст",
+            "boost_change_display": "Δ буста",
         }
     )
 
@@ -1099,10 +1192,12 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             "Запрос",
             "Совпавший запрос",
             "Тип совпадения",
-            "Позиция",
+            "WB позиция",
             "Органика",
             "Буст",
-            "Оценка",
+            "Оценка WB",
+            "Оценка органики",
+            "Оценка буста",
             "Статус",
             "Трафик",
             "Источник данных",
@@ -1128,9 +1223,9 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             use_container_width=False,
             key="pos_download_excel",
         )
-        st.caption("Цвет позиции: 🟢 1-10, 🟡 11-50, 🔴 51+ или не найдено.")
+        st.caption("Основные показатели показываются отдельно по каналам «WB», «Органика» и «Буст».")
 
-        def _style_position(value: Any) -> str:
+        def _style_rank_cell(value: Any) -> str:
             if value == "—" or pd.isna(value):
                 return "background-color: #fee2e2; color: #7f1d1d;"
             try:
@@ -1152,10 +1247,12 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             "Запрос",
             "Совпавший запрос",
             "Тип совпадения",
-            "Позиция",
+            "WB позиция",
             "Органика",
             "Буст",
-            "Оценка",
+            "Оценка WB",
+            "Оценка органики",
+            "Оценка буста",
             "Статус",
             "Трафик",
             "Источник данных",
@@ -1172,35 +1269,97 @@ def _render_positions_tab(logger: logging.Logger) -> None:
                 if category_view.empty:
                     st.info(f"Нет строк для категории «{category_label}».")
                 else:
-                    styled = category_view.style.applymap(_style_position, subset=["Позиция"])
+                    styled = category_view.style.applymap(_style_rank_cell, subset=["WB позиция", "Органика", "Буст"])
                     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-        top_success = (
-            table_frame[table_frame["Позиция"] != "—"]
+        top_wb = (
+            table_frame[table_frame["wb_numeric"].notna()]
             .copy()
-            .sort_values(by=["Позиция", "Артикул", "Запрос"], ascending=[True, True, True])
+            .sort_values(by=["wb_numeric", "Артикул", "Запрос"], ascending=[True, True, True])
             .head(5)
         )
-        if not top_success.empty:
-            st.subheader("🔥 ТОП-5 успешных строк")
-            st.dataframe(
-                top_success[["Артикул", "Категория", "Товар", "Запрос", "Позиция", "Трафик", "Источник данных"]],
-                use_container_width=True,
-                hide_index=True,
-            )
+        top_organic = (
+            table_frame[table_frame["organic_numeric"].notna()]
+            .copy()
+            .sort_values(by=["organic_numeric", "Артикул", "Запрос"], ascending=[True, True, True])
+            .head(5)
+        )
+        top_boost = (
+            table_frame[table_frame["boost_numeric"].notna()]
+            .copy()
+            .sort_values(by=["boost_numeric", "Артикул", "Запрос"], ascending=[True, True, True])
+            .head(5)
+        )
+        top_cols = st.columns(3)
+        with top_cols[0]:
+            st.subheader("📘 ТОП-5 по WB")
+            if top_wb.empty:
+                st.info("Нет строк с официальной WB-позицией.")
+            else:
+                st.dataframe(
+                    top_wb[["Артикул", "Категория", "Товар", "Запрос", "WB позиция", "Трафик", "Источник данных"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with top_cols[1]:
+            st.subheader("🔥 ТОП-5 по органике")
+            if top_organic.empty:
+                st.info("Нет строк с органической позицией.")
+            else:
+                st.dataframe(
+                    top_organic[["Артикул", "Категория", "Товар", "Запрос", "Органика", "Трафик", "Источник данных"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with top_cols[2]:
+            st.subheader("🚀 ТОП-5 по бусту")
+            if top_boost.empty:
+                st.info("Нет строк с позицией в бусте.")
+            else:
+                st.dataframe(
+                    top_boost[["Артикул", "Категория", "Товар", "Запрос", "Буст", "Трафик", "Источник данных"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         st.subheader("Сводка по последним позициям")
         st.dataframe(
-            latest_table[["Артикул", "Категория", "Запрос", "Дата", "Собрано", "Последняя позиция"]],
+            latest_table[
+                [
+                    "Артикул",
+                    "Категория",
+                    "Запрос",
+                    "Дата",
+                    "Собрано",
+                    "Последняя WB-позиция",
+                    "Последняя органика",
+                    "Последний буст",
+                ]
+            ],
             use_container_width=True,
             hide_index=True,
         )
 
-        st.subheader("Динамика позиции")
-        st.caption("Изменение = текущая позиция минус предыдущий замер для того же артикула и запроса.")
+        st.subheader("Динамика каналов")
+        st.caption("Изменение = текущая позиция минус предыдущий замер для того же артикула и запроса отдельно по каждому каналу.")
         st.dataframe(
             latest_delta_view[
-                ["Артикул", "Категория", "Запрос", "Дата", "Собрано", "Позиция", "Пред. позиция", "Изменение"]
+                [
+                    "Артикул",
+                    "Категория",
+                    "Запрос",
+                    "Дата",
+                    "Собрано",
+                    "WB позиция",
+                    "Пред. WB",
+                    "Δ WB",
+                    "Органика",
+                    "Пред. органика",
+                    "Δ органики",
+                    "Буст",
+                    "Пред. буст",
+                    "Δ буста",
+                ]
             ],
             use_container_width=True,
             hide_index=True,
@@ -1216,26 +1375,49 @@ def _render_positions_tab(logger: logging.Logger) -> None:
         chart_data = filtered[(filtered["nm_id"] == chart_nm) & (filtered["user_query"] == chart_query)].copy()
         chart_data["date_dt"] = pd.to_datetime(chart_data["date"], errors="coerce")
         chart_data = chart_data.sort_values(by=["date_dt", "collected_at"]).reset_index(drop=True)
-        chart_data["position_plot"] = pd.to_numeric(chart_data["position"], errors="coerce")
-        chart_data["position_plot"] = chart_data["position_plot"].fillna(101).astype(int)
-        chart_data["label"] = chart_data["position_plot"].apply(lambda value: "100+" if value >= 101 else str(value))
+        chart_data["wb_plot"] = pd.to_numeric(chart_data["wb_position"], errors="coerce")
+        chart_data["organic_plot"] = pd.to_numeric(chart_data["organic_position"], errors="coerce")
+        chart_data["boost_plot"] = pd.to_numeric(chart_data["boost_position"], errors="coerce")
 
-        figure = px.line(
-            chart_data,
-            x="date",
-            y="position_plot",
-            markers=True,
-            text="label",
-            labels={
-                "date": "Дата",
-                "position_plot": "Позиция",
-            },
-            title=f"Позиции: {chart_nm} / {chart_query}",
-        )
-        figure.update_traces(textposition="top center")
-        figure.update_yaxes(autorange="reversed", title="Позиция (100+ = не найдено)")
-        figure.update_layout(height=420)
-        st.plotly_chart(figure, use_container_width=True, config={"displaylogo": False})
+        chart_frames: list[pd.DataFrame] = []
+        if chart_data["wb_plot"].notna().any():
+            wb_plot = chart_data[["date", "wb_plot"]].copy()
+            wb_plot["Канал"] = "WB"
+            wb_plot["Позиция"] = wb_plot["wb_plot"].fillna(101).astype(int)
+            chart_frames.append(wb_plot[["date", "Канал", "Позиция"]])
+        if chart_data["organic_plot"].notna().any():
+            organic_plot = chart_data[["date", "organic_plot"]].copy()
+            organic_plot["Канал"] = "Органика"
+            organic_plot["Позиция"] = organic_plot["organic_plot"].fillna(101).astype(int)
+            chart_frames.append(organic_plot[["date", "Канал", "Позиция"]])
+        if chart_data["boost_plot"].notna().any():
+            boost_plot = chart_data[["date", "boost_plot"]].copy()
+            boost_plot["Канал"] = "Буст"
+            boost_plot["Позиция"] = boost_plot["boost_plot"].fillna(101).astype(int)
+            chart_frames.append(boost_plot[["date", "Канал", "Позиция"]])
+
+        if not chart_frames:
+            st.info("Для выбранной пары нет позиций ни по одному каналу.")
+        else:
+            chart_plot = pd.concat(chart_frames, ignore_index=True)
+
+            figure = px.line(
+                chart_plot,
+                x="date",
+                y="Позиция",
+                color="Канал",
+                markers=True,
+                labels={
+                    "date": "Дата",
+                    "Позиция": "Позиция",
+                    "Канал": "Канал",
+                },
+                title=f"WB, органика и буст: {chart_nm} / {chart_query}",
+                color_discrete_map={"WB": "#d97706", "Органика": "#2563eb", "Буст": "#16a34a"},
+            )
+            figure.update_yaxes(autorange="reversed", title="Позиция (100+ = не найдено)")
+            figure.update_layout(height=420)
+            st.plotly_chart(figure, use_container_width=True, config={"displaylogo": False})
 
     with tab_example:
         st.subheader("Пример таблицы")
@@ -1247,9 +1429,9 @@ def _render_positions_tab(logger: logging.Logger) -> None:
                 "Артикул",
                 "Категория",
                 "Запрос",
+                "WB позиция",
                 "Органика",
                 "Буст",
-                "Позиция",
                 "Источник данных",
                 "Статус",
                 "Ошибка",
@@ -1264,11 +1446,11 @@ def _render_positions_tab(logger: logging.Logger) -> None:
                         "Артикул": 123456789,
                         "Категория": "Женские трусы (все)",
                         "Запрос": "пример запроса",
+                        "WB позиция": 11,
                         "Органика": 32,
                         "Буст": 14,
-                        "Позиция": 14,
                         "Источник данных": "MPSTATS",
-                        "Статус": "Данные получены",
+                        "Статус": "✅ Найдено",
                         "Ошибка": "",
                     }
                 ]
@@ -1277,7 +1459,7 @@ def _render_positions_tab(logger: logging.Logger) -> None:
 
     with tab_matrix:
         st.subheader("Позиции артикула по каждому запросу")
-        st.caption("Формат как в Excel: по датам, для каждого артикула пары колонок «Органика / Буст».")
+        st.caption("Формат как в Excel: по датам, для каждого артикула каналы «WB / Органика / Буст».")
         matrix_query_options = sorted(filtered["user_query"].dropna().astype(str).unique().tolist())
         if not matrix_query_options:
             st.info("Нет данных для матрицы по текущим фильтрам.")
@@ -1299,9 +1481,19 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             matrix_source = matrix_source.sort_values(by=["date", "collected_at"]).groupby(
                 ["date", "nm_id"], as_index=False
             ).tail(1)
+            matrix_source["wb_numeric"] = pd.to_numeric(
+                matrix_source["position"].where(matrix_source["data_source"] == "wb_analytics"),
+                errors="coerce",
+            )
             matrix_source["organic_numeric"] = pd.to_numeric(matrix_source["organic_position"], errors="coerce")
             matrix_source["boost_numeric"] = pd.to_numeric(matrix_source["boost_position"], errors="coerce")
 
+            wb_wide = matrix_source.pivot_table(
+                index="date",
+                columns="nm_id",
+                values="wb_numeric",
+                aggfunc="last",
+            )
             organic_wide = matrix_source.pivot_table(
                 index="date",
                 columns="nm_id",
@@ -1316,13 +1508,14 @@ def _render_positions_tab(logger: logging.Logger) -> None:
             )
 
             all_nm_ids = sorted(
-                set(organic_wide.columns.tolist()) | set(boost_wide.columns.tolist())
+                set(wb_wide.columns.tolist()) | set(organic_wide.columns.tolist()) | set(boost_wide.columns.tolist())
             )
             if not all_nm_ids:
                 st.info("Нет данных для матрицы по выбранному запросу.")
             else:
                 matrix_display = pd.DataFrame(index=sorted(matrix_source["date"].dropna().astype(str).unique().tolist()))
                 for nm_id in all_nm_ids:
+                    matrix_display[f"{nm_id} | WB"] = wb_wide.get(nm_id, pd.Series(index=matrix_display.index))
                     matrix_display[f"{nm_id} | Органика"] = organic_wide.get(nm_id, pd.Series(index=matrix_display.index))
                     matrix_display[f"{nm_id} | Буст"] = boost_wide.get(nm_id, pd.Series(index=matrix_display.index))
 
@@ -1337,8 +1530,16 @@ def _render_positions_tab(logger: logging.Logger) -> None:
                 styled_matrix = matrix_display.style.format(
                     {column: lambda value: "—" if pd.isna(value) else int(value) for column in numeric_cols}
                 )
+                wb_cols = [column for column in numeric_cols if column.endswith("WB")]
                 organic_cols = [column for column in numeric_cols if column.endswith("Органика")]
                 boost_cols = [column for column in numeric_cols if column.endswith("Буст")]
+                if wb_cols:
+                    styled_matrix = styled_matrix.bar(
+                        subset=wb_cols,
+                        color="#F4C97A",
+                        align="left",
+                        vmin=0,
+                    )
                 if organic_cols:
                     styled_matrix = styled_matrix.bar(
                         subset=organic_cols,

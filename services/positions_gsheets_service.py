@@ -187,6 +187,8 @@ class PositionsSheetsService:
         new_frame["error_msg"] = new_frame["error_msg"].fillna("").astype(str).str.strip()
         new_frame.loc[new_frame["status"] == "", "status"] = "not_found"
         new_frame.loc[new_frame["data_source"] == "", "data_source"] = "unknown"
+        new_frame.loc[new_frame["data_source"] == "wb_analytics", "organic_position"] = pd.NA
+        new_frame.loc[new_frame["data_source"] == "wb_analytics", "boost_position"] = pd.NA
         new_frame = new_frame.dropna(subset=["nm_id"])
 
         key_existing = (
@@ -335,8 +337,15 @@ class PositionsSheetsService:
         frame["date"] = frame["date"].fillna("").astype(str).str.strip()
         frame["collected_at"] = frame["collected_at"].fillna("").astype(str).str.strip()
         frame["nm_id"] = pd.to_numeric(frame["nm_id"], errors="coerce").astype("Int64")
+        frame["position"] = pd.to_numeric(frame["position"], errors="coerce").astype("Int64")
         frame["organic_position"] = pd.to_numeric(frame["organic_position"], errors="coerce").astype("Int64")
         frame["boost_position"] = pd.to_numeric(frame["boost_position"], errors="coerce").astype("Int64")
+        if "data_source" in frame.columns:
+            frame["data_source"] = frame["data_source"].fillna("").astype(str).str.strip().str.lower()
+        else:
+            frame["data_source"] = ""
+        frame.loc[frame["data_source"] == "wb_analytics", "organic_position"] = pd.NA
+        frame.loc[frame["data_source"] == "wb_analytics", "boost_position"] = pd.NA
         if "product_name" in frame.columns:
             frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
         else:
@@ -383,7 +392,7 @@ class PositionsSheetsService:
         for category in POSITION_CATEGORY_ORDER:
             category_frame = frame[frame["category"] == category].copy()
             if category_frame.empty:
-                latest = pd.DataFrame(columns=["date", "nm_id", "organic_position", "boost_position"])
+                latest = pd.DataFrame(columns=["date", "nm_id", "position", "organic_position", "boost_position"])
                 matrix = pd.DataFrame(columns=["Дата"])
             else:
                 latest = (
@@ -462,18 +471,29 @@ class PositionsSheetsService:
             return pd.DataFrame(columns=["Дата"])
 
         source["nm_id"] = source["nm_id"].astype(int)
+        source["position"] = pd.to_numeric(source["position"], errors="coerce")
         source["organic_position"] = pd.to_numeric(source["organic_position"], errors="coerce")
         source["boost_position"] = pd.to_numeric(source["boost_position"], errors="coerce")
+        if "data_source" in source.columns:
+            source["data_source"] = source["data_source"].fillna("").astype(str).str.strip().str.lower()
+        else:
+            source["data_source"] = ""
+        source.loc[source["data_source"] == "wb_analytics", "organic_position"] = pd.NA
+        source.loc[source["data_source"] == "wb_analytics", "boost_position"] = pd.NA
+        source["wb_position"] = source["position"].where(source["data_source"] == "wb_analytics")
 
         date_list = sorted(source["date"].astype(str).unique().tolist())
         matrix = pd.DataFrame({"Дата": date_list})
+        wb_wide = source.pivot_table(index="date", columns="nm_id", values="wb_position", aggfunc="last")
         organic_wide = source.pivot_table(index="date", columns="nm_id", values="organic_position", aggfunc="last")
         boost_wide = source.pivot_table(index="date", columns="nm_id", values="boost_position", aggfunc="last")
 
-        all_nm = sorted(set(organic_wide.columns.tolist()) | set(boost_wide.columns.tolist()))
+        all_nm = sorted(set(wb_wide.columns.tolist()) | set(organic_wide.columns.tolist()) | set(boost_wide.columns.tolist()))
         for nm_id in all_nm:
+            wb_col = wb_wide.get(nm_id, pd.Series(index=date_list, dtype="float64"))
             organic_col = organic_wide.get(nm_id, pd.Series(index=date_list, dtype="float64"))
             boost_col = boost_wide.get(nm_id, pd.Series(index=date_list, dtype="float64"))
+            matrix[f"{nm_id} | WB"] = matrix["Дата"].map(wb_col.to_dict())
             matrix[f"{nm_id} | Органика"] = matrix["Дата"].map(organic_col.to_dict())
             matrix[f"{nm_id} | Буст"] = matrix["Дата"].map(boost_col.to_dict())
 
@@ -778,6 +798,8 @@ class PositionsSheetsService:
         migrated["status"] = migrated["status"].apply(self._normalize_status)
         migrated["data_source"] = migrated["data_source"].fillna("").astype(str).str.strip().str.lower()
         migrated.loc[~migrated["data_source"].isin({"mpstats", "wb_analytics"}), "data_source"] = "unknown"
+        migrated.loc[migrated["data_source"] == "wb_analytics", "organic_position"] = pd.NA
+        migrated.loc[migrated["data_source"] == "wb_analytics", "boost_position"] = pd.NA
         migrated["error_msg"] = migrated["error_msg"].fillna("").astype(str).str.strip()
         migrated = migrated.dropna(subset=["nm_id"]).copy()
         return migrated[RAW_HEADERS]
@@ -876,17 +898,16 @@ class PositionsSheetsService:
 
         if is_data_matrix and cols_count > 1:
             for column_index in range(1, cols_count):
-                is_organic = (column_index - 1) % 2 == 0
-                body_color = (
-                    {"red": 0.93, "green": 0.96, "blue": 1.0}
-                    if is_organic
-                    else {"red": 0.92, "green": 0.98, "blue": 0.94}
-                )
-                header_color = (
-                    {"red": 0.80, "green": 0.87, "blue": 0.98}
-                    if is_organic
-                    else {"red": 0.79, "green": 0.93, "blue": 0.82}
-                )
+                column_role = (column_index - 1) % 3
+                if column_role == 0:
+                    body_color = {"red": 1.0, "green": 0.96, "blue": 0.90}
+                    header_color = {"red": 0.98, "green": 0.89, "blue": 0.72}
+                elif column_role == 1:
+                    body_color = {"red": 0.93, "green": 0.96, "blue": 1.0}
+                    header_color = {"red": 0.80, "green": 0.87, "blue": 0.98}
+                else:
+                    body_color = {"red": 0.92, "green": 0.98, "blue": 0.94}
+                    header_color = {"red": 0.79, "green": 0.93, "blue": 0.82}
                 requests.extend(
                     [
                         {
